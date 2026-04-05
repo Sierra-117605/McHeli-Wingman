@@ -2,6 +2,7 @@ package com.mcheliwingman.handler;
 
 import com.mcheliwingman.McHeliWingman;
 import com.mcheliwingman.config.WingmanConfig;
+import com.mcheliwingman.mission.AutonomousState;
 import com.mcheliwingman.wingman.WingmanEntry;
 import com.mcheliwingman.wingman.WingmanRegistry;
 import com.mcheliwingman.wingman.WingmanState;
@@ -398,7 +399,12 @@ public class WingmanTickHandler {
                 applySlotBoost(wingman, fdx, fdy, fdz, distToSlot, leaderSpeed);
             }
 
-            if (entry.leader != null) syncGear(wingman, entry.leader);
+            if (entry.leader != null) {
+                syncGear(wingman, entry.leader);
+            } else if (entry.isAutonomous()) {
+                // 自律飛行中: autoState に応じてギアを自動制御
+                autoGear(wingman, entry.autoState);
+            }
         }
     }
 
@@ -911,6 +917,39 @@ public class WingmanTickHandler {
             else if (!lf && wf) unfoldLandingGear.invoke(wingman);
         } catch (Exception ex) {
             McHeliWingman.logger.debug("[Wingman] syncGear: {}", ex.getMessage());
+        }
+    }
+
+    /**
+     * 自律飛行中のギア自動制御。
+     * 巡航・旋回・ダウンウィンド・ベースレグ中は格納、それ以外（地上・アプローチ・着陸）は展開。
+     */
+    private void autoGear(Entity wingman, com.mcheliwingman.mission.AutonomousState state) {
+        resolveGearMethods(wingman);
+        if (isLandingGearFolded == null || canFoldLandingGear == null) return;
+        boolean retract;
+        switch (state) {
+            case CLIMB:
+            case ENROUTE:
+            case ATTACK:
+            case LOITER:
+            case DESCEND:
+            case CIRCUIT_DOWNWIND:
+            case CIRCUIT_BASE:
+                retract = true;
+                break;
+            default:  // TAXI_OUT, ALIGN, TAKEOFF_ROLL, CIRCUIT_FINAL, LANDING, TAXI_IN, PARKED など
+                retract = false;
+                break;
+        }
+        try {
+            boolean folded = (boolean) isLandingGearFolded.invoke(wingman);
+            boolean canFold = (boolean) canFoldLandingGear.invoke(wingman);
+            if (!canFold) return;
+            if (retract && !folded) foldLandingGear.invoke(wingman);
+            else if (!retract && folded) unfoldLandingGear.invoke(wingman);
+        } catch (Exception ex) {
+            McHeliWingman.logger.debug("[Wingman] autoGear: {}", ex.getMessage());
         }
     }
 

@@ -40,9 +40,10 @@ public class AutonomousFlightHandler {
     private static final double LOOKAHEAD_DIST     = 40.0;  // 滑走路中心線先読み距離 (blocks)
 
     // 着陸サーキット
-    private static final double CIRCUIT_ALT        = 60.0;  // 滑走路面からの回路高度 (blocks)
+    private static final double CIRCUIT_MIN_AGL    = 20.0;  // 滑走路面からの最低回路高度 (runway が高台の場合の保険)
     private static final double CIRCUIT_OFFSET     = 100.0; // 滑走路中心からの横距離 (blocks)
     private static final double CIRCUIT_FINAL_DIST = 300.0; // ファイナル進入開始距離 (B から blocks)
+    private static final double TOUCHDOWN_DIST     = 15.0;  // 接地判定距離 (固定翼の速度でも確実に検出できる大きめ値)
 
     // リフレクション
     private Method setRotYawMethod;
@@ -214,7 +215,8 @@ public class AutonomousFlightHandler {
         // 左ペルペンジキュラー: A→B を 90° CCW 回転 = (-dirZ, dirX)
         // 着陸方向 (B→A に向かう機体から見た左側 = 標準左旋回サーキット)
         double perpX = -dirZ, perpZ = dirX;
-        double circuitY = by + CIRCUIT_ALT;
+        // 巡航高度をサーキット高度として使用。滑走路が高台の場合は CIRCUIT_MIN_AGL を保証。
+        double circuitY = Math.max(CRUISE_ALT, by + CIRCUIT_MIN_AGL);
 
         switch (entry.autoState) {
             case DESCEND: {
@@ -224,10 +226,8 @@ public class AutonomousFlightHandler {
                 entry.autoTargetX = epX;
                 entry.autoTargetY = circuitY;
                 entry.autoTargetZ = epZ;
-                double dist = Math.sqrt(Math.pow(epX - wingman.posX, 2)
-                                      + Math.pow(circuitY - wingman.posY, 2)
-                                      + Math.pow(epZ - wingman.posZ, 2));
-                if (dist < 30) {
+                double hDist = Math.sqrt(Math.pow(epX - wingman.posX, 2) + Math.pow(epZ - wingman.posZ, 2));
+                if (hDist < 30) {
                     entry.autoState = AutonomousState.CIRCUIT_DOWNWIND;
                     McHeliWingman.logger.info("[Auto] {} entering downwind", shortId(wingman));
                 }
@@ -263,12 +263,13 @@ public class AutonomousFlightHandler {
             }
             case CIRCUIT_FINAL: {
                 // ファイナル: 中心線追従 + グライドスロープで B に向けて降下
-                // B を基準に、B の先方 (dirX/dirZ 方向) に機体がいる距離を求める
+                // B を基準に、B の先方 (dir 方向) に機体がいる距離を求める
                 double projFromB = (wingman.posX - bx) * dirX + (wingman.posZ - bz) * dirZ;
                 double tProj = Math.max(0, projFromB - LOOKAHEAD_DIST);
 
-                // グライドスロープ: 距離に比例して高度を下げる
-                double glideAlt = by + 1 + tProj * (CIRCUIT_ALT / CIRCUIT_FINAL_DIST);
+                // グライドスロープ: circuitY (巡航高度) → 滑走路面 を CIRCUIT_FINAL_DIST で線形補間
+                double touchdownAlt = by + 1;
+                double glideAlt = touchdownAlt + tProj * ((circuitY - touchdownAlt) / CIRCUIT_FINAL_DIST);
 
                 // 中心線追従: B + dir*tProj が目標点（横ズレ補正）
                 entry.autoTargetX = bx + dirX * tProj;
@@ -276,7 +277,7 @@ public class AutonomousFlightHandler {
                 entry.autoTargetZ = bz + dirZ * tProj;
 
                 double hDist = Math.sqrt(Math.pow(bx - wingman.posX, 2) + Math.pow(bz - wingman.posZ, 2));
-                if (hDist < TAXI_DIST) {
+                if (hDist < TOUCHDOWN_DIST) {
                     entry.autoState = AutonomousState.LANDING;
                     McHeliWingman.logger.info("[Auto] {} touchdown at B", shortId(wingman));
                 }
