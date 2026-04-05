@@ -133,11 +133,14 @@ public class AutonomousFlightHandler {
                 break;
             }
             case CLIMB: {
-                // 巡航高度まで上昇してからノード完了
-                entry.autoTargetX = wingman.posX;
+                // 現在の向きで前方500ブロックを目標にしながら巡航高度まで上昇
+                // （autoTargetX/Z を自機位置にすると目標が動いて旋回してしまうため）
+                double yawRad = Math.toRadians(wingman.rotationYaw);
+                entry.autoTargetX = wingman.posX - Math.sin(yawRad) * 500;
                 entry.autoTargetY = CRUISE_ALT;
-                entry.autoTargetZ = wingman.posZ;
+                entry.autoTargetZ = wingman.posZ + Math.cos(yawRad) * 500;
                 if (wingman.posY >= CRUISE_ALT - 5) {
+                    McHeliWingman.logger.info("[Auto] {} reached cruise alt", shortId(wingman));
                     entry.advanceMission();
                 }
                 break;
