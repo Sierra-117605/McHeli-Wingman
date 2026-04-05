@@ -488,8 +488,40 @@ public class WingmanCommand extends CommandBase {
                 player.sendMessage(new TextComponentString("§aMarker id set to §e" + args[2]));
                 break;
             }
+            case "type": {
+                if (args.length < 3) {
+                    player.sendMessage(new TextComponentString(
+                        "§7Usage: /wingman marker type <parking|runway_a|runway_b|waypoint>"));
+                    return;
+                }
+                net.minecraft.util.math.RayTraceResult rt2 = player.rayTrace(8, 1.0f);
+                if (rt2 == null || rt2.typeOfHit != net.minecraft.util.math.RayTraceResult.Type.BLOCK) {
+                    player.sendMessage(new TextComponentString("§cLook at a Wingman Marker block (within 8 blocks).")); return;
+                }
+                net.minecraft.util.math.BlockPos bp2 = rt2.getBlockPos();
+                net.minecraft.tileentity.TileEntity te2 = ws.getTileEntity(bp2);
+                if (!(te2 instanceof com.mcheliwingman.block.WingmanMarkerTileEntity)) {
+                    player.sendMessage(new TextComponentString("§cNot a Wingman Marker block.")); return;
+                }
+                com.mcheliwingman.block.MarkerType newType;
+                try {
+                    newType = com.mcheliwingman.block.MarkerType.valueOf(args[2].toUpperCase(Locale.ROOT));
+                } catch (IllegalArgumentException e) {
+                    player.sendMessage(new TextComponentString("§cUnknown type: " + args[2]
+                        + " §7(parking / runway_a / runway_b / waypoint)"));
+                    return;
+                }
+                com.mcheliwingman.block.WingmanMarkerTileEntity wte2 =
+                    (com.mcheliwingman.block.WingmanMarkerTileEntity) te2;
+                wte2.setMarkerType(newType);
+                com.mcheliwingman.registry.MarkerRegistry.register(ws, bp2, wte2);
+                player.sendMessage(new TextComponentString(
+                    "§aMarker type set to " + newType.displayName()
+                    + " §7id=" + (wte2.getMarkerId().isEmpty() ? "(none)" : wte2.getMarkerId())));
+                break;
+            }
             default:
-                player.sendMessage(new TextComponentString("§7Usage: /wingman marker <list|id <id>>"));
+                player.sendMessage(new TextComponentString("§7Usage: /wingman marker <list|id <id>|type <type>>"));
         }
     }
 
@@ -681,6 +713,8 @@ public class WingmanCommand extends CommandBase {
                     "mkrocket", "targetingpod", "clear");
         if (args.length == 2 && args[0].equalsIgnoreCase("marker"))
             return getListOfStringsMatchingLastWord(args, "list", "id", "type");
+        if (args.length == 3 && args[0].equalsIgnoreCase("marker") && args[1].equalsIgnoreCase("type"))
+            return getListOfStringsMatchingLastWord(args, "parking", "runway_a", "runway_b", "waypoint");
         if (args.length == 2 && args[0].equalsIgnoreCase("route"))
             return getListOfStringsMatchingLastWord(args, "create", "list", "delete", "show");
         if (args.length == 2 && args[0].equalsIgnoreCase("mission"))
