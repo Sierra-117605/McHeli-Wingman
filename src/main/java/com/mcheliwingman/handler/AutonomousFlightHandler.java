@@ -205,24 +205,23 @@ public class AutonomousFlightHandler {
                 break;
             }
             case APPROACH: {
-                // 進入ポイント（B 外側）から A（停止点）へ向かうグライドパス
-                // B→A 方向に機首を向けながら A の地上座標へ直接降下
-                entry.autoTargetX = ax;
-                entry.autoTargetY = ay + 1;
-                entry.autoTargetZ = az;
-                double hDist = Math.sqrt(Math.pow(ax - wingman.posX, 2) + Math.pow(az - wingman.posZ, 2));
+                // 接地点 B へグライドパス降下（進入ポイント → B に向けて B→A 方向に飛行）
+                entry.autoTargetX = bx;
+                entry.autoTargetY = by + 1;
+                entry.autoTargetZ = bz;
+                double hDist = Math.sqrt(Math.pow(bx - wingman.posX, 2) + Math.pow(bz - wingman.posZ, 2));
                 if (hDist < TAXI_DIST) {
                     entry.autoState = AutonomousState.LANDING;
-                    McHeliWingman.logger.info("[Auto] {} touchdown", shortId(wingman));
+                    McHeliWingman.logger.info("[Auto] {} touchdown at B", shortId(wingman));
                 }
                 break;
             }
             case LANDING: {
-                // 接地後スロットルゼロ → 速度が落ちたら完了
+                // 接地後スロットルゼロ → A 方向へ惰性で転がり停止
                 setThrottle(wingman, 0.0);
                 double spd = Math.sqrt(wingman.motionX * wingman.motionX + wingman.motionZ * wingman.motionZ);
                 if (spd < LANDING_SPEED) {
-                    McHeliWingman.logger.info("[Auto] {} landed at runway A", shortId(wingman));
+                    McHeliWingman.logger.info("[Auto] {} stopped", shortId(wingman));
                     entry.advanceMission();
                 }
                 break;
