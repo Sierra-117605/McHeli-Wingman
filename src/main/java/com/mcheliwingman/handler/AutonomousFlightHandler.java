@@ -106,25 +106,43 @@ public class AutonomousFlightHandler {
     // ─── TAKEOFF ─────────────────────────────────────────────────────────────
 
     private void tickTakeoff(WorldServer ws, Entity wingman, WingmanEntry entry, MissionNode node) {
+        // 滑走路 A（始端）と B（終端）の両マーカーが必要
+        MarkerRegistry.MarkerInfo rwyA = MarkerRegistry.findById(ws, MarkerType.RUNWAY_A, node.runwayId);
+        MarkerRegistry.MarkerInfo rwyB = MarkerRegistry.findById(ws, MarkerType.RUNWAY_B, node.runwayId);
+        if (rwyA == null || rwyB == null) {
+            McHeliWingman.logger.warn("[Auto] {} TAKEOFF: runway '{}' A or B not found, skipping", shortId(wingman), node.runwayId);
+            entry.advanceMission();
+            return;
+        }
+
+        double ax = rwyA.pos.getX() + 0.5, ay = rwyA.pos.getY(), az = rwyA.pos.getZ() + 0.5;
+        double bx = rwyB.pos.getX() + 0.5,                       bz = rwyB.pos.getZ() + 0.5;
+
+        // A→B の単位方向ベクトル（滑走路軸）
+        double rdx = bx - ax, rdz = bz - az;
+        double rlen = Math.sqrt(rdx * rdx + rdz * rdz);
+        if (rlen < 1) { entry.advanceMission(); return; }  // A と B が同一座標
+        double dirX = rdx / rlen, dirZ = rdz / rlen;
+
         switch (entry.autoState) {
             case TAXI_OUT: {
-                // 滑走路端Aへ地上滑走
-                MarkerRegistry.MarkerInfo rwy = MarkerRegistry.findById(ws, MarkerType.RUNWAY_A, node.runwayId);
-                if (rwy == null) { entry.advanceMission(); return; }
-                double tx = rwy.pos.getX() + 0.5;
-                double tz = rwy.pos.getZ() + 0.5;
-                double dist = Math.sqrt(Math.pow(tx - wingman.posX, 2) + Math.pow(tz - wingman.posZ, 2));
-                entry.autoTargetX = tx;
-                entry.autoTargetY = wingman.posY;  // 地上滑走: Y維持
-                entry.autoTargetZ = tz;
+                // 始端 A へ地上滑走（B 方向を遠方に設定しておき滑走路に機首を向けさせる）
+                double dist = Math.sqrt(Math.pow(ax - wingman.posX, 2) + Math.pow(az - wingman.posZ, 2));
+                entry.autoTargetX = ax + dirX * 2000;   // A 通過後も B 方向へ誘導
+                entry.autoTargetY = ay;
+                entry.autoTargetZ = az + dirZ * 2000;
                 if (dist < TAXI_DIST) {
                     entry.autoState = AutonomousState.TAKEOFF_ROLL;
+                    McHeliWingman.logger.info("[Auto] {} at runway A, starting roll", shortId(wingman));
                 }
                 break;
             }
             case TAKEOFF_ROLL: {
-                // スロットル全開・滑走路方向へ直進
+                // スロットル全開・滑走路方向（A→B）へ直進
                 setThrottle(wingman, 1.0);
+                entry.autoTargetX = ax + dirX * 2000;
+                entry.autoTargetY = ay;
+                entry.autoTargetZ = az + dirZ * 2000;
                 double spd = Math.sqrt(wingman.motionX * wingman.motionX + wingman.motionZ * wingman.motionZ);
                 if (spd >= TAKEOFF_SPEED) {
                     entry.autoState = AutonomousState.CLIMB;
@@ -133,12 +151,10 @@ public class AutonomousFlightHandler {
                 break;
             }
             case CLIMB: {
-                // 現在の向きで前方500ブロックを目標にしながら巡航高度まで上昇
-                // （autoTargetX/Z を自機位置にすると目標が動いて旋回してしまうため）
-                double yawRad = Math.toRadians(wingman.rotationYaw);
-                entry.autoTargetX = wingman.posX - Math.sin(yawRad) * 500;
+                // 滑走路軸方向を保ったまま巡航高度まで上昇
+                entry.autoTargetX = ax + dirX * 2000;
                 entry.autoTargetY = CRUISE_ALT;
-                entry.autoTargetZ = wingman.posZ + Math.cos(yawRad) * 500;
+                entry.autoTargetZ = az + dirZ * 2000;
                 if (wingman.posY >= CRUISE_ALT - 5) {
                     McHeliWingman.logger.info("[Auto] {} reached cruise alt", shortId(wingman));
                     entry.advanceMission();
@@ -153,37 +169,60 @@ public class AutonomousFlightHandler {
     // ─── LAND ────────────────────────────────────────────────────────────────
 
     private void tickLand(WorldServer ws, Entity wingman, WingmanEntry entry, MissionNode node) {
+        // 滑走路 A（停止点）と B（着陸進入端）の両マーカーが必要
+        MarkerRegistry.MarkerInfo rwyA = MarkerRegistry.findById(ws, MarkerType.RUNWAY_A, node.runwayId);
+        MarkerRegistry.MarkerInfo rwyB = MarkerRegistry.findById(ws, MarkerType.RUNWAY_B, node.runwayId);
+        if (rwyA == null || rwyB == null) {
+            McHeliWingman.logger.warn("[Auto] {} LAND: runway '{}' A or B not found, skipping", shortId(wingman), node.runwayId);
+            entry.advanceMission();
+            return;
+        }
+
+        double ax = rwyA.pos.getX() + 0.5, ay = rwyA.pos.getY(), az = rwyA.pos.getZ() + 0.5;
+        double bx = rwyB.pos.getX() + 0.5, by = rwyB.pos.getY(), bz = rwyB.pos.getZ() + 0.5;
+
+        // A→B 単位ベクトル（離陸方向）。着陸は逆向き B→A
+        double rdx = bx - ax, rdz = bz - az;
+        double rlen = Math.sqrt(rdx * rdx + rdz * rdz);
+        if (rlen < 1) { entry.advanceMission(); return; }
+        double dirX = rdx / rlen, dirZ = rdz / rlen;
+
         switch (entry.autoState) {
             case DESCEND: {
-                // 滑走路端Bの上空 50ブロックへ降下
-                MarkerRegistry.MarkerInfo rwy = MarkerRegistry.findById(ws, MarkerType.RUNWAY_B, node.runwayId);
-                if (rwy == null) { entry.advanceMission(); return; }
-                double tx = rwy.pos.getX() + 0.5;
-                double ty = rwy.pos.getY() + 50;
-                double tz = rwy.pos.getZ() + 0.5;
-                entry.autoTargetX = tx; entry.autoTargetY = ty; entry.autoTargetZ = tz;
-                double dist = Math.sqrt(Math.pow(tx - wingman.posX, 2) + Math.pow(ty - wingman.posY, 2) + Math.pow(tz - wingman.posZ, 2));
-                if (dist < 20) entry.autoState = AutonomousState.APPROACH;
+                // B の先方（B→A の逆、つまり A→B 延長線上）500 ブロック・高度 80 の進入ポイントへ
+                // ＝ B から A→B 方向に 500 ブロック進んだ点（B の外側）
+                double epX = bx + dirX * 500;
+                double epY = by + 80;
+                double epZ = bz + dirZ * 500;
+                entry.autoTargetX = epX; entry.autoTargetY = epY; entry.autoTargetZ = epZ;
+                double dist = Math.sqrt(Math.pow(epX - wingman.posX, 2)
+                                      + Math.pow(epY - wingman.posY, 2)
+                                      + Math.pow(epZ - wingman.posZ, 2));
+                if (dist < 40) {
+                    entry.autoState = AutonomousState.APPROACH;
+                    McHeliWingman.logger.info("[Auto] {} starting approach", shortId(wingman));
+                }
                 break;
             }
             case APPROACH: {
-                // 滑走路端Bへ直接降下アプローチ
-                MarkerRegistry.MarkerInfo rwy = MarkerRegistry.findById(ws, MarkerType.RUNWAY_B, node.runwayId);
-                if (rwy == null) { entry.advanceMission(); return; }
-                double tx = rwy.pos.getX() + 0.5;
-                double ty = rwy.pos.getY() + 1;
-                double tz = rwy.pos.getZ() + 0.5;
-                entry.autoTargetX = tx; entry.autoTargetY = ty; entry.autoTargetZ = tz;
-                double hDist = Math.sqrt(Math.pow(tx - wingman.posX, 2) + Math.pow(tz - wingman.posZ, 2));
-                if (hDist < TAXI_DIST) entry.autoState = AutonomousState.LANDING;
+                // 進入ポイント（B 外側）から A（停止点）へ向かうグライドパス
+                // B→A 方向に機首を向けながら A の地上座標へ直接降下
+                entry.autoTargetX = ax;
+                entry.autoTargetY = ay + 1;
+                entry.autoTargetZ = az;
+                double hDist = Math.sqrt(Math.pow(ax - wingman.posX, 2) + Math.pow(az - wingman.posZ, 2));
+                if (hDist < TAXI_DIST) {
+                    entry.autoState = AutonomousState.LANDING;
+                    McHeliWingman.logger.info("[Auto] {} touchdown", shortId(wingman));
+                }
                 break;
             }
             case LANDING: {
-                // 接地後スロットルゼロ
+                // 接地後スロットルゼロ → 速度が落ちたら完了
                 setThrottle(wingman, 0.0);
                 double spd = Math.sqrt(wingman.motionX * wingman.motionX + wingman.motionZ * wingman.motionZ);
                 if (spd < LANDING_SPEED) {
-                    McHeliWingman.logger.info("[Auto] {} landed", shortId(wingman));
+                    McHeliWingman.logger.info("[Auto] {} landed at runway A", shortId(wingman));
                     entry.advanceMission();
                 }
                 break;
