@@ -64,7 +64,13 @@ public class WingmanCommand extends CommandBase {
             case "auto":     executeAuto(player);             break;
             case "hold":     executeHold(player);             break;
             case "weapon":   executeWeapon(player, args);     break;
+            case "minalt":   executeMinAlt(player, args);     break;
+            case "maxalt":   executeMaxAlt(player, args);     break;
+            case "alt":      executeAlt(player, args);        break;
             case "spawnuav": executeSpawnUav(player, args);   break;
+            case "marker":   executeMarker(player, args);     break;
+            case "route":    executeRoute(player, args);      break;
+            case "mission":  executeMission(player, server, args); break;
             default: player.sendMessage(new TextComponentString("§7Usage: " + getUsage(sender)));
         }
     }
@@ -266,6 +272,71 @@ public class WingmanCommand extends CommandBase {
     }
 
     // =========================================================================
+    // minalt [value]  — minimum Y altitude during attack runs
+    // =========================================================================
+
+    private void executeMinAlt(EntityPlayerMP player, String[] args) {
+        if (args.length < 2) {
+            player.sendMessage(new TextComponentString(
+                    "§7Current min attack altitude: §e" + WingmanConfig.minAttackAltitude
+                    + "§7  (0 = no floor)\n§7Usage: /wingman minalt <y>"));
+            return;
+        }
+        try {
+            double val = Double.parseDouble(args[1]);
+            if (val < 0) { player.sendMessage(new TextComponentString("§cValue must be >= 0.")); return; }
+            WingmanConfig.minAttackAltitude = val;
+            String msg = val == 0
+                    ? "§aMin attack altitude cleared (no floor)."
+                    : "§aMin attack altitude set to §eY=" + val + "§a.";
+            player.sendMessage(new TextComponentString(msg));
+        } catch (NumberFormatException ex) {
+            player.sendMessage(new TextComponentString("§cInvalid number."));
+        }
+    }
+
+    // =========================================================================
+    // maxalt [value]  — maximum Y altitude during attack runs
+    // =========================================================================
+
+    private void executeMaxAlt(EntityPlayerMP player, String[] args) {
+        if (args.length < 2) {
+            player.sendMessage(new TextComponentString(
+                    "§7Current max attack altitude: §e" + WingmanConfig.maxAttackAltitude
+                    + "§7  (0 = no ceiling)\n§7Usage: /wingman maxalt <y>"));
+            return;
+        }
+        try {
+            double val = Double.parseDouble(args[1]);
+            if (val < 0) { player.sendMessage(new TextComponentString("§cValue must be >= 0.")); return; }
+            WingmanConfig.maxAttackAltitude = val;
+            String msg = val == 0
+                    ? "§aMax attack altitude cleared (no ceiling)."
+                    : "§aMax attack altitude set to §eY=" + val + "§a.";
+            player.sendMessage(new TextComponentString(msg));
+        } catch (NumberFormatException ex) {
+            player.sendMessage(new TextComponentString("§cInvalid number."));
+        }
+    }
+
+    // =========================================================================
+    // alt clear  — reset both minalt and maxalt
+    // =========================================================================
+
+    private void executeAlt(EntityPlayerMP player, String[] args) {
+        if (args.length >= 2 && args[1].equalsIgnoreCase("clear")) {
+            WingmanConfig.minAttackAltitude = 0.0;
+            WingmanConfig.maxAttackAltitude = 0.0;
+            player.sendMessage(new TextComponentString("§aAttack altitude limits cleared (min=0, max=0)."));
+        } else {
+            player.sendMessage(new TextComponentString(
+                    "§7Current: min=§e" + WingmanConfig.minAttackAltitude
+                    + "§7  max=§e" + WingmanConfig.maxAttackAltitude
+                    + "§7\n§7Usage: /wingman alt clear"));
+        }
+    }
+
+    // =========================================================================
     // spawnuav [type]
     // =========================================================================
 
@@ -378,6 +449,185 @@ public class WingmanCommand extends CommandBase {
     }
 
     // =========================================================================
+    // marker <list|id|type> — WingmanMarkerBlock 管理
+    // =========================================================================
+
+    private void executeMarker(EntityPlayerMP player, String[] args) {
+        WorldServer ws = (WorldServer) player.world;
+        if (args.length < 2) {
+            player.sendMessage(new TextComponentString("§7Usage: /wingman marker <list|id <id>|type <type>>"));
+            return;
+        }
+        switch (args[1].toLowerCase(Locale.ROOT)) {
+            case "list": {
+                List<com.mcheliwingman.registry.MarkerRegistry.MarkerInfo> markers =
+                    com.mcheliwingman.registry.MarkerRegistry.snapshot(ws);
+                if (markers.isEmpty()) { player.sendMessage(new TextComponentString("§7No markers registered.")); return; }
+                player.sendMessage(new TextComponentString("§e=== Wingman Markers ==="));
+                for (com.mcheliwingman.registry.MarkerRegistry.MarkerInfo m : markers) {
+                    player.sendMessage(new TextComponentString(
+                        "§7[" + m.type.name() + "] §fid=" + (m.id.isEmpty() ? "(none)" : m.id)
+                        + " §7@ " + m.pos.getX() + "," + m.pos.getY() + "," + m.pos.getZ()));
+                }
+                break;
+            }
+            case "id": {
+                if (args.length < 3) { player.sendMessage(new TextComponentString("§7Usage: /wingman marker id <id>")); return; }
+                // プレイヤーが見ているブロックを対象にする
+                net.minecraft.util.math.RayTraceResult rt = player.rayTrace(8, 1.0f);
+                if (rt == null || rt.typeOfHit != net.minecraft.util.math.RayTraceResult.Type.BLOCK) {
+                    player.sendMessage(new TextComponentString("§cLook at a Wingman Marker block (within 8 blocks).")); return;
+                }
+                net.minecraft.util.math.BlockPos bp = rt.getBlockPos();
+                com.mcheliwingman.registry.MarkerRegistry.setId(ws, bp, args[2]);
+                net.minecraft.tileentity.TileEntity te = ws.getTileEntity(bp);
+                if (te instanceof com.mcheliwingman.block.WingmanMarkerTileEntity) {
+                    ((com.mcheliwingman.block.WingmanMarkerTileEntity) te).setMarkerId(args[2]);
+                    com.mcheliwingman.registry.MarkerRegistry.register(ws, bp, (com.mcheliwingman.block.WingmanMarkerTileEntity) te);
+                }
+                player.sendMessage(new TextComponentString("§aMarker id set to §e" + args[2]));
+                break;
+            }
+            default:
+                player.sendMessage(new TextComponentString("§7Usage: /wingman marker <list|id <id>>"));
+        }
+    }
+
+    // =========================================================================
+    // route <create|list|delete|show> — ミッションルート管理
+    // =========================================================================
+
+    private void executeRoute(EntityPlayerMP player, String[] args) {
+        if (args.length < 2) {
+            player.sendMessage(new TextComponentString("§7Usage: /wingman route <create <name> <node...>|list|delete <name>|show <name>>"));
+            return;
+        }
+        switch (args[1].toLowerCase(Locale.ROOT)) {
+            case "create": {
+                if (args.length < 4) {
+                    player.sendMessage(new TextComponentString(
+                        "§7Usage: /wingman route create <name> <node> [node...]\n"
+                        + "§7Nodes: flyto:x,y,z  takeoff:id  land:id  attack:radius  loiter:ticks  park:id"));
+                    return;
+                }
+                String name = args[2];
+                List<com.mcheliwingman.mission.MissionNode> nodes = new ArrayList<>();
+                for (int i = 3; i < args.length; i++) {
+                    try { nodes.add(com.mcheliwingman.mission.MissionNode.parse(args[i])); }
+                    catch (Exception e) { player.sendMessage(new TextComponentString("§cInvalid node: " + args[i])); return; }
+                }
+                com.mcheliwingman.mission.MissionPlan.put(name, nodes);
+                player.sendMessage(new TextComponentString("§aRoute §e" + name + "§a saved (" + nodes.size() + " nodes)."));
+                break;
+            }
+            case "list": {
+                java.util.Set<String> names = com.mcheliwingman.mission.MissionPlan.names();
+                if (names.isEmpty()) { player.sendMessage(new TextComponentString("§7No routes defined.")); return; }
+                player.sendMessage(new TextComponentString("§e=== Routes ==="));
+                for (String n : names) player.sendMessage(new TextComponentString("§7  " + n));
+                break;
+            }
+            case "delete": {
+                if (args.length < 3) { player.sendMessage(new TextComponentString("§7Usage: /wingman route delete <name>")); return; }
+                boolean removed = com.mcheliwingman.mission.MissionPlan.remove(args[2]);
+                player.sendMessage(removed
+                    ? new TextComponentString("§aRoute §e" + args[2] + "§a deleted.")
+                    : new TextComponentString("§cRoute not found: " + args[2]));
+                break;
+            }
+            case "show": {
+                if (args.length < 3) { player.sendMessage(new TextComponentString("§7Usage: /wingman route show <name>")); return; }
+                List<com.mcheliwingman.mission.MissionNode> nodes = com.mcheliwingman.mission.MissionPlan.get(args[2]);
+                if (nodes == null) { player.sendMessage(new TextComponentString("§cRoute not found: " + args[2])); return; }
+                player.sendMessage(new TextComponentString("§e=== Route: " + args[2] + " ==="));
+                for (int i = 0; i < nodes.size(); i++)
+                    player.sendMessage(new TextComponentString("§7  [" + i + "] " + nodes.get(i)));
+                break;
+            }
+            default:
+                player.sendMessage(new TextComponentString("§7Usage: /wingman route <create|list|delete|show>"));
+        }
+    }
+
+    // =========================================================================
+    // mission <assign|abort|status> — ミッション割り当て・管理
+    // =========================================================================
+
+    private void executeMission(EntityPlayerMP player, MinecraftServer server, String[] args) {
+        if (args.length < 2) {
+            player.sendMessage(new TextComponentString("§7Usage: /wingman mission <assign <uuid> <route>|abort [uuid]|status>"));
+            return;
+        }
+        WorldServer ws = (WorldServer) player.world;
+        switch (args[1].toLowerCase(Locale.ROOT)) {
+            case "assign": {
+                if (args.length < 4) {
+                    player.sendMessage(new TextComponentString("§7Usage: /wingman mission assign <uuid> <route>"));
+                    return;
+                }
+                UUID uid = parseUUID(player, args[2]);
+                if (uid == null) return;
+                Entity wingman = ws.getEntityFromUuid(uid);
+                if (wingman == null) { player.sendMessage(new TextComponentString("§cEntity not found.")); return; }
+                List<com.mcheliwingman.mission.MissionNode> nodes = com.mcheliwingman.mission.MissionPlan.get(args[3]);
+                if (nodes == null) { player.sendMessage(new TextComponentString("§cRoute not found: " + args[3])); return; }
+
+                com.mcheliwingman.wingman.WingmanEntry entry = WingmanRegistry.get(uid);
+                if (entry == null) {
+                    // 未登録の場合は自律エントリとして登録
+                    entry = new com.mcheliwingman.wingman.WingmanEntry();
+                    WingmanRegistry.put(uid, entry);
+                }
+                entry.mission      = nodes;
+                entry.missionIndex = 0;
+                entry.missionNodeTimer = 0;
+                entry.autoState    = com.mcheliwingman.mission.AutonomousState.ENROUTE;
+                player.sendMessage(new TextComponentString(
+                    "§aMission §e" + args[3] + "§a assigned to " + shortId(wingman) + " (" + nodes.size() + " nodes)."));
+                break;
+            }
+            case "abort": {
+                if (args.length >= 3) {
+                    UUID uid = parseUUID(player, args[2]);
+                    if (uid == null) return;
+                    com.mcheliwingman.wingman.WingmanEntry entry = WingmanRegistry.get(uid);
+                    if (entry != null) {
+                        entry.mission   = null;
+                        entry.autoState = com.mcheliwingman.mission.AutonomousState.NONE;
+                    }
+                    player.sendMessage(new TextComponentString("§aMission aborted for " + args[2]));
+                } else {
+                    // 全自律機を停止
+                    int count = 0;
+                    for (com.mcheliwingman.wingman.WingmanEntry e : WingmanRegistry.snapshot().values()) {
+                        if (e.isAutonomous()) { e.mission = null; e.autoState = com.mcheliwingman.mission.AutonomousState.NONE; count++; }
+                    }
+                    player.sendMessage(new TextComponentString("§aAborted " + count + " autonomous mission(s)."));
+                }
+                break;
+            }
+            case "status": {
+                boolean any = false;
+                for (Map.Entry<UUID, com.mcheliwingman.wingman.WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+                    com.mcheliwingman.wingman.WingmanEntry entry = e.getValue();
+                    if (!entry.isAutonomous()) continue;
+                    any = true;
+                    com.mcheliwingman.mission.MissionNode cur = entry.currentNode();
+                    player.sendMessage(new TextComponentString(
+                        "§7[" + e.getKey().toString().substring(0, 8) + "] "
+                        + "§fstate=" + entry.autoState
+                        + " node=" + entry.missionIndex + "/" + entry.mission.size()
+                        + " §7(" + (cur != null ? cur.toString() : "done") + ")"));
+                }
+                if (!any) player.sendMessage(new TextComponentString("§7No active autonomous missions."));
+                break;
+            }
+            default:
+                player.sendMessage(new TextComponentString("§7Usage: /wingman mission <assign|abort|status>"));
+        }
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 
@@ -418,16 +668,23 @@ public class WingmanCommand extends CommandBase {
     public List<String> getTabCompletions(MinecraftServer server, ICommandSender sender,
                                           String[] args, BlockPos pos) {
         if (args.length == 1) return getListOfStringsMatchingLastWord(args,
-                "follow", "stop", "status", "dist", "maxwings", "engage", "auto", "hold", "weapon", "spawnuav");
+                "follow", "stop", "status", "dist", "maxwings", "engage", "auto", "hold",
+                "weapon", "minalt", "maxalt", "alt", "spawnuav",
+                "marker", "route", "mission");
+        if (args.length == 2 && args[0].equalsIgnoreCase("alt"))
+            return getListOfStringsMatchingLastWord(args, "clear");
         if (args.length == 2 && args[0].equalsIgnoreCase("weapon"))
             return getListOfStringsMatchingLastWord(args,
-                    // エイリアス（便利名）
                     "gun", "cannon", "missile", "rocket", "bomb", "torpedo",
-                    // McHeli実際の型名（Readme_Weapon.txtの Type= 値）
                     "machinegun1", "machinegun2", "cas",
                     "asmissile", "aamissile", "atmissile", "tvmissile",
-                    "mkrocket", "targetingpod",
-                    "clear");
+                    "mkrocket", "targetingpod", "clear");
+        if (args.length == 2 && args[0].equalsIgnoreCase("marker"))
+            return getListOfStringsMatchingLastWord(args, "list", "id", "type");
+        if (args.length == 2 && args[0].equalsIgnoreCase("route"))
+            return getListOfStringsMatchingLastWord(args, "create", "list", "delete", "show");
+        if (args.length == 2 && args[0].equalsIgnoreCase("mission"))
+            return getListOfStringsMatchingLastWord(args, "assign", "abort", "status");
         return Collections.emptyList();
     }
 }

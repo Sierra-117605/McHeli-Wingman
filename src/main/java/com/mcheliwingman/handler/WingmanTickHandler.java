@@ -157,6 +157,8 @@ public class WingmanTickHandler {
     private final java.util.Map<UUID, Integer> fireCooldowns = new java.util.HashMap<>();
     // 発射後エスケープカウンタ（残りtick > 0 中は現在ヨーを維持してエスケープ飛行）
     private final java.util.Map<UUID, Integer> postFireEscape = new java.util.HashMap<>();
+    // デバッグログ抑制カウンタ（20tickに1回だけ出力）
+    private int boostDebugTick = 0;
 
     // ─── Phase.START ─────────────────────────────────────────────────────────
 
@@ -179,7 +181,15 @@ public class WingmanTickHandler {
                 // 攻撃中: 全力スロットル
                 maintainEngine(wingman, 1.0);
                 steerToTarget(ws, wingman, entry);
-            } else {
+            } else if (entry.isAutonomous()) {
+                // 自律飛行中: AutonomousFlightHandlerが設定した目標へ全力追従
+                double dx = entry.autoTargetX - wingman.posX;
+                double dy = entry.autoTargetY - wingman.posY;
+                double dz = entry.autoTargetZ - wingman.posZ;
+                double distToTarget = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                maintainEngine(wingman, distToTarget > 20 ? 1.0 : 0.5);
+                steerToTarget(ws, wingman, entry);
+            } else if (entry.leader != null) {
                 // フォーメーション追従: 指定スロットまでの距離に応じてスロットル調整
                 double[] fp = formationPos(entry.leader, entry.formationSlot);
                 double dx = fp[0] - wingman.posX;
@@ -277,6 +287,50 @@ public class WingmanTickHandler {
             try { if (lastRiderPitchField != null) lastRiderPitchField.setFloat(wingman, aimPitch); }
             catch (Exception ignored) {}
         }
+
+        // 他の子機との分離（formationSideDist を最小間隔として反発ヨー補正）
+        applySiblingRepulsion(wingman, entry, currentYaw, maxYawRate);
+    }
+
+    /**
+     * 同一リーダーの他の子機が近すぎる場合、反発方向にヨーをオフセットする。
+     * 最小間隔 = formationSideDist（0の場合は formationRearDist を使用）。
+     */
+    private void applySiblingRepulsion(Entity wingman, WingmanEntry entry, float currentYaw, float maxYawRate) {
+        double minDist = WingmanConfig.formationSideDist > 0
+                ? WingmanConfig.formationSideDist
+                : WingmanConfig.formationRearDist;
+        if (minDist <= 0) return;
+
+        double repX = 0, repZ = 0;
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            if (e.getKey().equals(wingman.getUniqueID())) continue;
+            WingmanEntry other = e.getValue();
+            if (other.leader != entry.leader) continue;
+            // 他の子機のエンティティをワールドから取得
+            Entity sibling = wingman.world.loadedEntityList.stream()
+                    .filter(en -> en.getUniqueID().equals(e.getKey()))
+                    .findFirst().orElse(null);
+            if (sibling == null) continue;
+            double sdx = wingman.posX - sibling.posX;
+            double sdz = wingman.posZ - sibling.posZ;
+            double dist = Math.sqrt(sdx * sdx + sdz * sdz);
+            if (dist < minDist && dist > 0.01) {
+                // 近すぎる: 離れる方向に反発ベクトルを積算（距離に反比例）
+                double strength = (minDist - dist) / minDist;
+                repX += (sdx / dist) * strength;
+                repZ += (sdz / dist) * strength;
+            }
+        }
+
+        if (repX == 0 && repZ == 0) return;
+        float repYaw = (float) Math.toDegrees(Math.atan2(-repX, repZ));
+        float yawDiff = repYaw - currentYaw;
+        while (yawDiff >  180f) yawDiff -= 360f;
+        while (yawDiff < -180f) yawDiff += 360f;
+        // 反発は最大yawRateの半分だけ補正（通常の追従を阻害しないよう控えめに）
+        float repStep = Math.max(-maxYawRate * 0.5f, Math.min(maxYawRate * 0.5f, yawDiff));
+        setRotYaw(wingman, currentYaw + repStep);
     }
 
     /** 機首方向固定の直射武器（gun/cannon/cas）か判定。これ以外はフリールック可能とみなす。 */
@@ -302,7 +356,8 @@ public class WingmanTickHandler {
             UUID id = e.getKey();
             WingmanEntry entry = e.getValue();
 
-            if (entry.leader == null || entry.leader.isDead) {
+            // 自律機はleaderがなくても継続。通常follower機はleader死亡で解除。
+            if (!entry.isAutonomous() && (entry.leader == null || entry.leader.isDead)) {
                 WingmanRegistry.remove(id);
                 McHeliWingman.logger.info("[Wingman] {} unregistered — leader gone", id);
                 continue;
@@ -328,6 +383,21 @@ public class WingmanTickHandler {
                 }
             }
 
+            // スロット追従ブースト（編隊追従時のみ、McHeli物理更新後にpos加算）
+            if (entry.attackMode == WingmanEntry.ATK_NONE && !entry.isAutonomous()
+                    && entry.leader != null && !isLeaderStopped(entry.leader)) {
+                double[] fp = formationPos(entry.leader, entry.formationSlot);
+                double fdx = fp[0] - wingman.posX;
+                double fdy = fp[1] - wingman.posY;
+                double fdz = fp[2] - wingman.posZ;
+                double distToSlot = Math.sqrt(fdx * fdx + fdy * fdy + fdz * fdz);
+                double leaderSpeed = Math.sqrt(
+                    entry.leader.motionX * entry.leader.motionX +
+                    entry.leader.motionY * entry.leader.motionY +
+                    entry.leader.motionZ * entry.leader.motionZ);
+                applySlotBoost(wingman, fdx, fdy, fdz, distToSlot, leaderSpeed);
+            }
+
             syncGear(wingman, entry.leader);
         }
     }
@@ -345,33 +415,66 @@ public class WingmanTickHandler {
                 double dz    = target.posZ - wingman.posZ;
                 double hDist = Math.sqrt(dx * dx + dz * dz);
                 double idealTY = target.posY + altOffset;
+                // 攻撃高度フロア/シーリング（/wingman minalt・maxalt で設定、0=無効）
+                if (WingmanConfig.minAttackAltitude > 0)
+                    idealTY = Math.max(idealTY, WingmanConfig.minAttackAltitude);
+                if (WingmanConfig.maxAttackAltitude > 0)
+                    idealTY = Math.min(idealTY, WingmanConfig.maxAttackAltitude);
 
+                double[] raw;
                 if (hDist > standoff) {
                     // スタンドオフ距離まで接近
                     double ratio = (hDist - standoff) / hDist;
-                    return new double[]{
+                    raw = new double[]{
                         wingman.posX + dx * ratio,
                         idealTY,
                         wingman.posZ + dz * ratio
                     };
                 } else {
                     // スタンドオフ圏内: ターゲットから離れる方向に逃げる
-                    // 単位ベクトル(wingman→target)の逆方向へ standoff*1.5 の地点を目標にする
                     double norm = Math.max(hDist, 0.1);
-                    double awayX = -dx / norm;
-                    double awayZ = -dz / norm;
-                    return new double[]{
-                        target.posX + awayX * standoff * 1.5,
+                    raw = new double[]{
+                        target.posX + (-dx / norm) * standoff * 1.5,
                         idealTY,
-                        target.posZ + awayZ * standoff * 1.5
+                        target.posZ + (-dz / norm) * standoff * 1.5
                     };
                 }
+
+                // リーダーとの最小クリアランス（Side/Rear の小さい方を半径とする）
+                raw = applyLeaderClearance(raw, entry.leader);
+                return raw;
             }
         }
-        if (entry.state == WingmanState.FOLLOWING) {
+        // 自律飛行中: AutonomousFlightHandlerが設定した目標座標を使う
+        if (entry.isAutonomous()) {
+            return new double[]{ entry.autoTargetX, entry.autoTargetY, entry.autoTargetZ };
+        }
+        if (entry.state == WingmanState.FOLLOWING && entry.leader != null) {
             return formationPos(entry.leader, entry.formationSlot);
         }
         return null;
+    }
+
+    /**
+     * 移動目標がリーダー機に近づきすぎる場合、リーダーから押し出す補正を加える。
+     * クリアランス半径 = max(formationSideDist, formationRearDist) / 2
+     */
+    private double[] applyLeaderClearance(double[] movTarget, Entity leader) {
+        double clearance = Math.max(WingmanConfig.formationSideDist, WingmanConfig.formationRearDist);
+        if (clearance <= 0) return movTarget;
+        double ldx = movTarget[0] - leader.posX;
+        double ldz = movTarget[2] - leader.posZ;
+        double hd  = Math.sqrt(ldx * ldx + ldz * ldz);
+        if (hd < clearance && hd > 0.01) {
+            // リーダーから clearance だけ離れた点に押し出す
+            double scale = clearance / hd;
+            return new double[]{
+                leader.posX + ldx * scale,
+                movTarget[1],
+                leader.posZ + ldz * scale
+            };
+        }
+        return movTarget;
     }
 
     /** エイム目標。攻撃中のみターゲット座標を返す。 */
@@ -425,23 +528,52 @@ public class WingmanTickHandler {
             return ws.getEntityFromUuid(entry.manualTargetId);
         if (entry.attackMode == WingmanEntry.ATK_AUTO) {
             java.util.Set<UUID> taken = getTargetedUUIDs(wingman.getUniqueID(), entry.leader);
-            Entity target = findNearestHostile(wingman, AUTO_ATTACK_RANGE, taken);
+            java.util.List<Entity> siblings = getSiblings(wingman.getUniqueID(), entry.leader, wingman.world);
+            Entity target = findNearestHostile(wingman, AUTO_ATTACK_RANGE, taken, siblings);
             entry.currentAutoTarget = (target != null) ? target.getUniqueID() : null;
             return target;
         }
         return null;
     }
 
-    private Entity findNearestHostile(Entity wingman, double range, java.util.Set<UUID> exclude) {
+    private Entity findNearestHostile(Entity wingman, double range,
+                                      java.util.Set<UUID> exclude, java.util.List<Entity> siblings) {
+        double minSep = WingmanConfig.formationSideDist > 0
+                ? WingmanConfig.formationSideDist
+                : WingmanConfig.formationRearDist;
         double bestSq = range * range;
         Entity best   = null;
+        outer:
         for (Entity e : wingman.world.loadedEntityList) {
             if (e == wingman || !(e instanceof IMob) || e.isDead) continue;
             if (exclude != null && exclude.contains(e.getUniqueID())) continue;
+            // 攻撃経路（wingman→ターゲット間の中点）が他の子機に近すぎる場合はスキップ
+            if (minSep > 0 && siblings != null) {
+                double midX = (wingman.posX + e.posX) * 0.5;
+                double midZ = (wingman.posZ + e.posZ) * 0.5;
+                for (Entity sib : siblings) {
+                    double sdx = midX - sib.posX;
+                    double sdz = midZ - sib.posZ;
+                    if (sdx * sdx + sdz * sdz < minSep * minSep) continue outer;
+                }
+            }
             double dsq = wingman.getDistanceSq(e);
             if (dsq < bestSq) { bestSq = dsq; best = e; }
         }
         return best;
+    }
+
+    /** 同一リーダーに従う他の子機エンティティリストを返す。 */
+    private java.util.List<Entity> getSiblings(UUID selfId, Entity leader, net.minecraft.world.World world) {
+        java.util.List<Entity> result = new java.util.ArrayList<>();
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            if (e.getKey().equals(selfId)) continue;
+            if (e.getValue().leader != leader) continue;
+            for (Entity en : world.loadedEntityList) {
+                if (en.getUniqueID().equals(e.getKey())) { result.add(en); break; }
+            }
+        }
+        return result;
     }
 
     /** 同一リーダーの他子機が攻撃中のターゲットUUIDセットを返す（分散攻撃用）。 */
@@ -483,15 +615,21 @@ public class WingmanTickHandler {
             // 弾薬が空の場合は最大値まで補充（UAVは自律補給）
             ensureAmmoLoaded(chosen);
 
-            boolean isASMissile = "asmissile".equalsIgnoreCase(resolvedType);
+            // paramを複数パターンで試す（asmissileはtargetEntityがnullだとNPEになるため）
+            // パターン1: targetEntityあり、位置=aircraft
+            // パターン2: targetEntityあり、位置=target
+            // パターン3: targetEntityなし、位置=target（旧asmissile専用）
+            Object param1 = buildParamFull(aircraft, target, aircraft.posX, aircraft.posY, aircraft.posZ, yaw, pitch);
+            Object param2 = buildParamFull(aircraft, target, target.posX, target.posY, target.posZ, yaw, pitch);
+            Object param3 = buildParamFull(aircraft, null,   target.posX, target.posY, target.posZ, yaw, pitch);
+            if (param1 == null) return;
 
-            Object param = isASMissile
-                    ? buildParamFull(aircraft, null, target.posX, target.posY, target.posZ, yaw, pitch)
-                    : buildParamFull(aircraft, target, aircraft.posX, aircraft.posY, aircraft.posZ, yaw, pitch);
-            if (param == null) return;
-
-            boolean fired = fireDirectShot(chosen, param);
-            if (!fired) fired = fireViaUse(aircraft, leader, chosen, param);
+            boolean fired = fireDirectShot(chosen, param1);
+            if (!fired) fired = fireDirectShot(chosen, param2);
+            if (!fired) fired = fireDirectShot(chosen, param3);
+            if (!fired) fired = fireViaUse(aircraft, leader, chosen, param1);
+            if (!fired) fired = fireViaUse(aircraft, leader, chosen, param2);
+            if (!fired) fired = fireViaUse(aircraft, leader, chosen, param3);
 
             if (fired) {
                 int cooldown = fireCooldownForType(resolvedType);
@@ -583,7 +721,7 @@ public class WingmanTickHandler {
             if (wb == null) return false;
             return Boolean.TRUE.equals(weaponBaseShot.invoke(wb, param));
         } catch (Exception e) {
-            McHeliWingman.logger.debug("[Wingman] fireDirectShot: {}", e.getMessage());
+            McHeliWingman.logger.debug("[Wingman] fireDirectShot: {}", e.toString());
             return false;
         }
     }
@@ -598,7 +736,7 @@ public class WingmanTickHandler {
             }
             return Boolean.TRUE.equals(weaponSetUse.invoke(weaponSet, param));
         } catch (Exception e) {
-            McHeliWingman.logger.debug("[Wingman] fireViaUse: {}", e.getMessage());
+            McHeliWingman.logger.debug("[Wingman] fireViaUse: {}", e.toString());
             return false;
         } finally {
             if (lastRiddenByEntityField != null) {
@@ -647,6 +785,14 @@ public class WingmanTickHandler {
     private static final double THROTTLE_BLEND_FAR  = 80.0;  // この距離以上: 全力
     private static final double THROTTLE_BLEND_NEAR = 12.0;  // この距離以下: 親機同調
 
+    // スロット追従ブースト（スロットル上限突破用motion加算）
+    // McHeliの物理更新後にmotion加算するため機体固有の速度上限を超えられる
+    // ブーストはリーダー速度×BOOST_LEADER_MULT を上限とする（動的計算）
+    // → リーダー速度 + ブースト ≒ リーダー速度×3 を実現
+    private static final double BOOST_LEADER_MULT = 2.0;  // リーダー速度に掛けた値が最大ブースト量
+    private static final double BOOST_DIST_ON  = 80.0;    // ブースト開始距離
+    private static final double BOOST_DIST_OFF = 20.0;    // ブースト終了距離（これ以下でゼロに）
+
     /**
      * フォーメーション追従用適応スロットル。
      * 遠い: 全力 / 近い: 親機スロットルに同調して追い抜き防止。
@@ -670,6 +816,55 @@ public class WingmanTickHandler {
         targetThrottle = Math.max(minThrottle, Math.min(1.0, targetThrottle));
 
         applyThrottle(aircraft, targetThrottle);
+    }
+
+    /**
+     * スロット追従ブースト。
+     * McHeliが物理更新でmotionを確定した後（Phase.END）に呼び出し、
+     * スロット方向へ追加velocityを加算してスロットル上限を超えた速度を実現する。
+     *
+     * ブースト量はスロットまでの距離で線形補間:
+     *   dist >= BOOST_DIST_ON  → BOOST_MAX
+     *   dist <= BOOST_DIST_OFF → 0（オーバーシュート防止）
+     */
+    /**
+     * スロット追従ブースト。
+     * 最大ブースト = leaderSpeed × BOOST_LEADER_MULT（≒ リーダー速度の3倍まで到達可能）。
+     * スロット距離でtaper: BOOST_DIST_ON以上=全力、BOOST_DIST_OFF以下=ゼロ。
+     */
+    private void applySlotBoost(Entity wingman, double fdx, double fdy, double fdz,
+                                 double distToSlot, double leaderSpeed) {
+        if (distToSlot <= BOOST_DIST_OFF) return;
+
+        double taper;
+        if (distToSlot >= BOOST_DIST_ON) {
+            taper = 1.0;
+        } else {
+            taper = (distToSlot - BOOST_DIST_OFF) / (BOOST_DIST_ON - BOOST_DIST_OFF);
+        }
+
+        double boostAmount = leaderSpeed * BOOST_LEADER_MULT * taper;
+
+        double norm = Math.max(distToSlot, 0.01);
+        double bx = (fdx / norm) * boostAmount;
+        double by = (fdy / norm) * boostAmount;
+        double bz = (fdz / norm) * boostAmount;
+
+        // motionへの加算はMcHeliが次tickに上書きするため無効。
+        // posX/Y/Zを直接加算してMcHeliの物理更新後に追加変位を与える。
+        double newX = wingman.posX + bx;
+        double newY = wingman.posY + by;
+        double newZ = wingman.posZ + bz;
+        wingman.setPosition(newX, newY, newZ);
+
+        boostDebugTick++;
+        if (boostDebugTick >= 20) {
+            boostDebugTick = 0;
+            McHeliWingman.logger.info("[Wingman/Boost] dist={} leaderSpd={} boost={} applied to pos",
+                (int)distToSlot,
+                String.format("%.3f", leaderSpeed),
+                String.format("%.3f", boostAmount));
+        }
     }
 
     /** 指定スロットル値を直接適用する（攻撃モード・強制指定用）。 */
