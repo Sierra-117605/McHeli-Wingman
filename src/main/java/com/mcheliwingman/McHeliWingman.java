@@ -10,6 +10,7 @@ import com.mcheliwingman.handler.RangeOverrideHandler;
 import com.mcheliwingman.handler.UavChunkStreamer;
 import com.mcheliwingman.handler.WingmanTickHandler;
 import com.mcheliwingman.mission.MissionPlan;
+import com.mcheliwingman.network.WingmanNetwork;
 import net.minecraft.item.ItemBlock;
 import net.minecraftforge.common.ForgeChunkManager;
 import net.minecraftforge.common.MinecraftForge;
@@ -70,6 +71,7 @@ public class McHeliWingman {
         MinecraftForge.EVENT_BUS.register(new UavChunkStreamer());
         MinecraftForge.EVENT_BUS.register(new WingmanTickHandler());
         MinecraftForge.EVENT_BUS.register(new AutonomousFlightHandler());
+        WingmanNetwork.register();
         logger.info("{} initialized", NAME);
     }
 

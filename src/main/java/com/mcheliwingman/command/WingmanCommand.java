@@ -2,6 +2,8 @@ package com.mcheliwingman.command;
 
 import com.mcheliwingman.McHeliWingman;
 import com.mcheliwingman.config.WingmanConfig;
+import com.mcheliwingman.network.PacketPlannerData;
+import com.mcheliwingman.network.WingmanNetwork;
 import com.mcheliwingman.util.McheliReflect;
 import com.mcheliwingman.wingman.WingmanEntry;
 import com.mcheliwingman.wingman.WingmanRegistry;
@@ -71,6 +73,7 @@ public class WingmanCommand extends CommandBase {
             case "marker":   executeMarker(player, args);     break;
             case "route":    executeRoute(player, args);      break;
             case "mission":  executeMission(player, server, args); break;
+            case "gui":      executeGui(player);                   break;
             default: player.sendMessage(new TextComponentString("§7Usage: " + getUsage(sender)));
         }
     }
@@ -660,6 +663,50 @@ public class WingmanCommand extends CommandBase {
     }
 
     // =========================================================================
+    // gui  — open Mission Planner GUI on the client
+    // =========================================================================
+
+    private void executeGui(EntityPlayerMP player) {
+        WorldServer ws = (WorldServer) player.world;
+        PacketPlannerData pkt = new PacketPlannerData();
+
+        // Collect UAVs
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            WingmanEntry entry = e.getValue();
+            Entity entity = ws.getEntityFromUuid(e.getKey());
+            PacketPlannerData.UavDto dto = new PacketPlannerData.UavDto();
+            dto.uuid = e.getKey().toString();
+            dto.name = getAircraftTypeName(entity);
+            dto.state = entry.isAutonomous() ? entry.autoState.name() : (entry.leader != null ? "FOLLOWING" : "IDLE");
+            dto.nodeIdx = entry.missionIndex;
+            dto.nodeCount = (entry.mission != null) ? entry.mission.size() : 0;
+            pkt.uavs.add(dto);
+        }
+
+        // Collect routes
+        for (String name : com.mcheliwingman.mission.MissionPlan.names()) {
+            List<com.mcheliwingman.mission.MissionNode> nodes = com.mcheliwingman.mission.MissionPlan.get(name);
+            PacketPlannerData.RouteDto dto = new PacketPlannerData.RouteDto();
+            dto.name = name;
+            if (nodes != null) {
+                for (com.mcheliwingman.mission.MissionNode n : nodes) dto.nodes.add(n.toString());
+            }
+            pkt.routes.add(dto);
+        }
+
+        WingmanNetwork.sendToPlayer(pkt, player);
+    }
+
+    private String getAircraftTypeName(Entity entity) {
+        if (entity == null) return "Unknown";
+        try {
+            Method m = findMethod(entity.getClass(), "getKindName");
+            if (m != null) return (String) m.invoke(entity);
+        } catch (Exception ignored) {}
+        return entity.getClass().getSimpleName();
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 
@@ -696,13 +743,21 @@ public class WingmanCommand extends CommandBase {
         return null;
     }
 
+    private static Method findMethod(Class<?> cls, String name) {
+        while (cls != null) {
+            try { Method m = cls.getDeclaredMethod(name); m.setAccessible(true); return m; }
+            catch (NoSuchMethodException ignored) { cls = cls.getSuperclass(); }
+        }
+        return null;
+    }
+
     @Override
     public List<String> getTabCompletions(MinecraftServer server, ICommandSender sender,
                                           String[] args, BlockPos pos) {
         if (args.length == 1) return getListOfStringsMatchingLastWord(args,
                 "follow", "stop", "status", "dist", "maxwings", "engage", "auto", "hold",
                 "weapon", "minalt", "maxalt", "alt", "spawnuav",
-                "marker", "route", "mission");
+                "marker", "route", "mission", "gui");
         if (args.length == 2 && args[0].equalsIgnoreCase("alt"))
             return getListOfStringsMatchingLastWord(args, "clear");
         if (args.length == 2 && args[0].equalsIgnoreCase("weapon"))
