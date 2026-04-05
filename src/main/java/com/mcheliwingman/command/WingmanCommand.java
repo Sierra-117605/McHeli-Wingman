@@ -706,10 +706,14 @@ public class WingmanCommand extends CommandBase {
 
     private String getAircraftTypeName(Entity entity) {
         if (entity == null) return "Unknown";
-        try {
-            Method m = findMethod(entity.getClass(), "getKindName");
-            if (m != null) return (String) m.invoke(entity);
-        } catch (Exception ignored) {}
+        // getTypeName() returns the model name (e.g. "MQ-9"), getKindName() returns kind (e.g. "plane")
+        for (String methodName : new String[]{"getTypeName", "getKindName"}) {
+            try {
+                Method m = entity.getClass().getMethod(methodName);
+                Object result = m.invoke(entity);
+                if (result instanceof String && !((String) result).isEmpty()) return (String) result;
+            } catch (Exception ignored) {}
+        }
         return entity.getClass().getSimpleName();
     }
 
