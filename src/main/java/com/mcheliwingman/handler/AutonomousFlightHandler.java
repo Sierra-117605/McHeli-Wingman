@@ -29,11 +29,20 @@ import java.util.UUID;
 public class AutonomousFlightHandler {
 
     // 各フェーズの到達判定距離
-    private static final double ARRIVE_DIST   = 8.0;   // FLY_TO 到達判定
-    private static final double TAXI_DIST     = 5.0;   // 地上滑走 到達判定
-    private static final double CRUISE_ALT    = 80.0;  // デフォルト巡航高度（Y座標）
-    private static final double TAKEOFF_SPEED = 0.6;   // 離陸判定速度 (blocks/tick)
-    private static final double LANDING_SPEED = 0.1;   // 着陸完了判定速度
+    private static final double ARRIVE_DIST        = 8.0;   // FLY_TO 到達判定
+    private static final double TAXI_DIST          = 5.0;   // 地上滑走 到達判定
+    private static final double CRUISE_ALT         = 80.0;  // デフォルト巡航高度（Y座標）
+    private static final double TAKEOFF_SPEED      = 0.6;   // 離陸判定速度 (blocks/tick)
+    private static final double LANDING_SPEED      = 0.1;   // 着陸完了判定速度
+
+    // 離陸整列・中心線追従
+    private static final double ALIGN_TOLERANCE    = 15.0;  // 機首整列許容角度 (°)
+    private static final double LOOKAHEAD_DIST     = 40.0;  // 滑走路中心線先読み距離 (blocks)
+
+    // 着陸サーキット
+    private static final double CIRCUIT_ALT        = 60.0;  // 滑走路面からの回路高度 (blocks)
+    private static final double CIRCUIT_OFFSET     = 100.0; // 滑走路中心からの横距離 (blocks)
+    private static final double CIRCUIT_FINAL_DIST = 300.0; // ファイナル進入開始距離 (B から blocks)
 
     // リフレクション
     private Method setRotYawMethod;
@@ -106,7 +115,6 @@ public class AutonomousFlightHandler {
     // ─── TAKEOFF ─────────────────────────────────────────────────────────────
 
     private void tickTakeoff(WorldServer ws, Entity wingman, WingmanEntry entry, MissionNode node) {
-        // 滑走路 A（始端）と B（終端）の両マーカーが必要
         MarkerRegistry.MarkerInfo rwyA = MarkerRegistry.findById(ws, MarkerType.RUNWAY_A, node.runwayId);
         MarkerRegistry.MarkerInfo rwyB = MarkerRegistry.findById(ws, MarkerType.RUNWAY_B, node.runwayId);
         if (rwyA == null || rwyB == null) {
@@ -118,31 +126,51 @@ public class AutonomousFlightHandler {
         double ax = rwyA.pos.getX() + 0.5, ay = rwyA.pos.getY(), az = rwyA.pos.getZ() + 0.5;
         double bx = rwyB.pos.getX() + 0.5,                       bz = rwyB.pos.getZ() + 0.5;
 
-        // A→B の単位方向ベクトル（滑走路軸）
         double rdx = bx - ax, rdz = bz - az;
         double rlen = Math.sqrt(rdx * rdx + rdz * rdz);
-        if (rlen < 1) { entry.advanceMission(); return; }  // A と B が同一座標
+        if (rlen < 1) { entry.advanceMission(); return; }
         double dirX = rdx / rlen, dirZ = rdz / rlen;
+
+        // 滑走路方向の Minecraft yaw (atan2(-dx, dz))
+        float runwayYaw = (float) Math.toDegrees(Math.atan2(-dirX, dirZ));
 
         switch (entry.autoState) {
             case TAXI_OUT: {
-                // 始端 A へ地上滑走（B 方向を遠方に設定しておき滑走路に機首を向けさせる）
+                // A へ向かいながら B 方向を遠方目標に設定 → 機首が滑走路軸に揃う
                 double dist = Math.sqrt(Math.pow(ax - wingman.posX, 2) + Math.pow(az - wingman.posZ, 2));
-                entry.autoTargetX = ax + dirX * 2000;   // A 通過後も B 方向へ誘導
+                entry.autoTargetX = ax + dirX * 2000;
                 entry.autoTargetY = ay;
                 entry.autoTargetZ = az + dirZ * 2000;
                 if (dist < TAXI_DIST) {
+                    entry.autoState = AutonomousState.ALIGN;
+                    entry.missionNodeTimer = 0;
+                    McHeliWingman.logger.info("[Auto] {} at runway A, aligning with runway", shortId(wingman));
+                }
+                break;
+            }
+            case ALIGN: {
+                // 機首が滑走路方向に揃うまで待機（最大 300 tick でタイムアウト）
+                entry.missionNodeTimer++;
+                entry.autoTargetX = ax + dirX * 2000;
+                entry.autoTargetY = ay;
+                entry.autoTargetZ = az + dirZ * 2000;
+                float yawDiff = runwayYaw - wingman.rotationYaw;
+                while (yawDiff >  180f) yawDiff -= 360f;
+                while (yawDiff < -180f) yawDiff += 360f;
+                boolean aligned   = Math.abs(yawDiff) < ALIGN_TOLERANCE;
+                boolean timedOut  = entry.missionNodeTimer > 300;
+                if (aligned || timedOut) {
+                    entry.missionNodeTimer = 0;
                     entry.autoState = AutonomousState.TAKEOFF_ROLL;
-                    McHeliWingman.logger.info("[Auto] {} at runway A, starting roll", shortId(wingman));
+                    McHeliWingman.logger.info("[Auto] {} aligned{}, starting roll", shortId(wingman),
+                                              timedOut && !aligned ? " (timeout)" : "");
                 }
                 break;
             }
             case TAKEOFF_ROLL: {
-                // スロットル全開・滑走路方向（A→B）へ直進
+                // 全スロットル + 中心線追従（横ズレ補正）
                 setThrottle(wingman, 1.0);
-                entry.autoTargetX = ax + dirX * 2000;
-                entry.autoTargetY = ay;
-                entry.autoTargetZ = az + dirZ * 2000;
+                centerlineTarget(entry, wingman, ax, ay, az, dirX, dirZ, LOOKAHEAD_DIST);
                 double spd = Math.sqrt(wingman.motionX * wingman.motionX + wingman.motionZ * wingman.motionZ);
                 if (spd >= TAKEOFF_SPEED) {
                     entry.autoState = AutonomousState.CLIMB;
@@ -151,10 +179,8 @@ public class AutonomousFlightHandler {
                 break;
             }
             case CLIMB: {
-                // 滑走路軸方向を保ったまま巡航高度まで上昇
-                entry.autoTargetX = ax + dirX * 2000;
-                entry.autoTargetY = CRUISE_ALT;
-                entry.autoTargetZ = az + dirZ * 2000;
+                // 滑走路軸上を中心線追従しながら巡航高度まで上昇
+                centerlineTarget(entry, wingman, ax, CRUISE_ALT, az, dirX, dirZ, LOOKAHEAD_DIST);
                 if (wingman.posY >= CRUISE_ALT - 5) {
                     McHeliWingman.logger.info("[Auto] {} reached cruise alt", shortId(wingman));
                     entry.advanceMission();
@@ -169,7 +195,6 @@ public class AutonomousFlightHandler {
     // ─── LAND ────────────────────────────────────────────────────────────────
 
     private void tickLand(WorldServer ws, Entity wingman, WingmanEntry entry, MissionNode node) {
-        // 滑走路 A（停止点）と B（着陸進入端）の両マーカーが必要
         MarkerRegistry.MarkerInfo rwyA = MarkerRegistry.findById(ws, MarkerType.RUNWAY_A, node.runwayId);
         MarkerRegistry.MarkerInfo rwyB = MarkerRegistry.findById(ws, MarkerType.RUNWAY_B, node.runwayId);
         if (rwyA == null || rwyB == null) {
@@ -181,34 +206,75 @@ public class AutonomousFlightHandler {
         double ax = rwyA.pos.getX() + 0.5, ay = rwyA.pos.getY(), az = rwyA.pos.getZ() + 0.5;
         double bx = rwyB.pos.getX() + 0.5, by = rwyB.pos.getY(), bz = rwyB.pos.getZ() + 0.5;
 
-        // A→B 単位ベクトル（離陸方向）。着陸は逆向き B→A
         double rdx = bx - ax, rdz = bz - az;
         double rlen = Math.sqrt(rdx * rdx + rdz * rdz);
         if (rlen < 1) { entry.advanceMission(); return; }
         double dirX = rdx / rlen, dirZ = rdz / rlen;
 
+        // 左ペルペンジキュラー: A→B を 90° CCW 回転 = (-dirZ, dirX)
+        // 着陸方向 (B→A に向かう機体から見た左側 = 標準左旋回サーキット)
+        double perpX = -dirZ, perpZ = dirX;
+        double circuitY = by + CIRCUIT_ALT;
+
         switch (entry.autoState) {
             case DESCEND: {
-                // B の先方（B→A の逆、つまり A→B 延長線上）500 ブロック・高度 80 の進入ポイントへ
-                // ＝ B から A→B 方向に 500 ブロック進んだ点（B の外側）
-                double epX = bx + dirX * 500;
-                double epY = by + 80;
-                double epZ = bz + dirZ * 500;
-                entry.autoTargetX = epX; entry.autoTargetY = epY; entry.autoTargetZ = epZ;
+                // サーキット入口: B の左側 CIRCUIT_OFFSET ブロック・高度 circuitY
+                double epX = bx + perpX * CIRCUIT_OFFSET;
+                double epZ = bz + perpZ * CIRCUIT_OFFSET;
+                entry.autoTargetX = epX;
+                entry.autoTargetY = circuitY;
+                entry.autoTargetZ = epZ;
                 double dist = Math.sqrt(Math.pow(epX - wingman.posX, 2)
-                                      + Math.pow(epY - wingman.posY, 2)
+                                      + Math.pow(circuitY - wingman.posY, 2)
                                       + Math.pow(epZ - wingman.posZ, 2));
-                if (dist < 40) {
-                    entry.autoState = AutonomousState.APPROACH;
-                    McHeliWingman.logger.info("[Auto] {} starting approach", shortId(wingman));
+                if (dist < 30) {
+                    entry.autoState = AutonomousState.CIRCUIT_DOWNWIND;
+                    McHeliWingman.logger.info("[Auto] {} entering downwind", shortId(wingman));
                 }
                 break;
             }
-            case APPROACH: {
-                // 接地点 B へグライドパス降下（進入ポイント → B に向けて B→A 方向に飛行）
-                entry.autoTargetX = bx;
-                entry.autoTargetY = by + 1;
-                entry.autoTargetZ = bz;
+            case CIRCUIT_DOWNWIND: {
+                // ダウンウィンド: B-側オフセット → A-側オフセット (滑走路と平行・逆方向)
+                double dwX = ax + perpX * CIRCUIT_OFFSET;
+                double dwZ = az + perpZ * CIRCUIT_OFFSET;
+                entry.autoTargetX = dwX;
+                entry.autoTargetY = circuitY;
+                entry.autoTargetZ = dwZ;
+                double dist = Math.sqrt(Math.pow(dwX - wingman.posX, 2) + Math.pow(dwZ - wingman.posZ, 2));
+                if (dist < 30) {
+                    entry.autoState = AutonomousState.CIRCUIT_BASE;
+                    McHeliWingman.logger.info("[Auto] {} turning base", shortId(wingman));
+                }
+                break;
+            }
+            case CIRCUIT_BASE: {
+                // ベースレグ: ファイナル延長線上 (B の先方 CIRCUIT_FINAL_DIST) へ向かう
+                double fX = bx + dirX * CIRCUIT_FINAL_DIST;
+                double fZ = bz + dirZ * CIRCUIT_FINAL_DIST;
+                entry.autoTargetX = fX;
+                entry.autoTargetY = circuitY;
+                entry.autoTargetZ = fZ;
+                double dist = Math.sqrt(Math.pow(fX - wingman.posX, 2) + Math.pow(fZ - wingman.posZ, 2));
+                if (dist < 40) {
+                    entry.autoState = AutonomousState.CIRCUIT_FINAL;
+                    McHeliWingman.logger.info("[Auto] {} on final", shortId(wingman));
+                }
+                break;
+            }
+            case CIRCUIT_FINAL: {
+                // ファイナル: 中心線追従 + グライドスロープで B に向けて降下
+                // B を基準に、B の先方 (dirX/dirZ 方向) に機体がいる距離を求める
+                double projFromB = (wingman.posX - bx) * dirX + (wingman.posZ - bz) * dirZ;
+                double tProj = Math.max(0, projFromB - LOOKAHEAD_DIST);
+
+                // グライドスロープ: 距離に比例して高度を下げる
+                double glideAlt = by + 1 + tProj * (CIRCUIT_ALT / CIRCUIT_FINAL_DIST);
+
+                // 中心線追従: B + dir*tProj が目標点（横ズレ補正）
+                entry.autoTargetX = bx + dirX * tProj;
+                entry.autoTargetY = glideAlt;
+                entry.autoTargetZ = bz + dirZ * tProj;
+
                 double hDist = Math.sqrt(Math.pow(bx - wingman.posX, 2) + Math.pow(bz - wingman.posZ, 2));
                 if (hDist < TAXI_DIST) {
                     entry.autoState = AutonomousState.LANDING;
@@ -217,7 +283,7 @@ public class AutonomousFlightHandler {
                 break;
             }
             case LANDING: {
-                // 接地後スロットルゼロ → A 方向へ惰性で転がり停止
+                // 接地後スロットルゼロ → A 方向へ惰性停止
                 setThrottle(wingman, 0.0);
                 double spd = Math.sqrt(wingman.motionX * wingman.motionX + wingman.motionZ * wingman.motionZ);
                 if (spd < LANDING_SPEED) {
@@ -229,6 +295,26 @@ public class AutonomousFlightHandler {
             default:
                 entry.autoState = AutonomousState.DESCEND;
         }
+    }
+
+    /**
+     * 滑走路中心線追従ターゲット。
+     * 機体を軸に射影し、LOOKAHEAD 先の中心線上の点を autoTarget に設定する。
+     * 横ズレが生じても連続的に補正される。
+     *
+     * @param ax/az  滑走路 A 端の XZ 座標（軸の起点）
+     * @param targetY  目標高度（地上滑走時は ay、上昇時は CRUISE_ALT など）
+     * @param dirX/dirZ  A→B 方向の単位ベクトル
+     * @param lookahead  先読み距離 (blocks)
+     */
+    private static void centerlineTarget(WingmanEntry entry, Entity wingman,
+                                          double ax, double targetY, double az,
+                                          double dirX, double dirZ, double lookahead) {
+        double proj = (wingman.posX - ax) * dirX + (wingman.posZ - az) * dirZ;
+        double t = proj + lookahead;
+        entry.autoTargetX = ax + dirX * t;
+        entry.autoTargetY = targetY;
+        entry.autoTargetZ = az + dirZ * t;
     }
 
     // ─── ATTACK ──────────────────────────────────────────────────────────────
