@@ -701,6 +701,22 @@ public class WingmanCommand extends CommandBase {
             pkt.routes.add(dto);
         }
 
+        // Collect markers
+        for (com.mcheliwingman.registry.MarkerRegistry.MarkerInfo m : com.mcheliwingman.registry.MarkerRegistry.snapshot(ws)) {
+            PacketPlannerData.MarkerDto dto = new PacketPlannerData.MarkerDto();
+            dto.type = m.type.name();
+            dto.id   = m.id;
+            dto.x    = m.pos.getX();
+            dto.y    = m.pos.getY();
+            dto.z    = m.pos.getZ();
+            pkt.markers.add(dto);
+        }
+
+        // Player position for "My Pos" button
+        pkt.playerX = player.posX;
+        pkt.playerY = player.posY;
+        pkt.playerZ = player.posZ;
+
         WingmanNetwork.sendToPlayer(pkt, player);
     }
 

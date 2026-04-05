@@ -62,7 +62,39 @@ public class WingmanMarkerBlock extends Block {
     public void onBlockAdded(World world, BlockPos pos, IBlockState state) {
         if (!world.isRemote) {
             WingmanMarkerTileEntity te = getTe(world, pos);
-            if (te != null) MarkerRegistry.register(world, pos, te);
+            if (te != null) {
+                if (te.getMarkerId().isEmpty()) {
+                    te.setMarkerId(autoId(world, te.getMarkerType()));
+                    te.markDirty();
+                }
+                MarkerRegistry.register(world, pos, te);
+                player_hint(world, pos, te);
+            }
+        }
+    }
+
+    private static String autoId(World world, MarkerType type) {
+        String prefix;
+        switch (type) {
+            case PARKING:  prefix = "p";  break;
+            case RUNWAY_A: prefix = "ra"; break;
+            case RUNWAY_B: prefix = "rb"; break;
+            default:       prefix = "wp"; break;
+        }
+        int n = MarkerRegistry.findByType(world, type).size() + 1;
+        return prefix + "_" + n;
+    }
+
+    /** 設置したプレイヤーにIDを通知する（サーバー側でプレイヤーが近くにいれば）。 */
+    private static void player_hint(World world, BlockPos pos, WingmanMarkerTileEntity te) {
+        for (net.minecraft.entity.player.EntityPlayer p : world.playerEntities) {
+            if (p.getDistanceSq(pos.getX(), pos.getY(), pos.getZ()) < 16 * 16) {
+                p.sendMessage(new TextComponentString(
+                    "§7Marker placed: " + te.getMarkerType().displayName()
+                    + " §7id=§e" + te.getMarkerId()
+                    + " §7(Shift+click or §f/wingman marker type§7 to change type)"));
+                break;
+            }
         }
     }
 

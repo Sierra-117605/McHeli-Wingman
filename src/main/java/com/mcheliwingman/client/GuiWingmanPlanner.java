@@ -3,6 +3,7 @@ package com.mcheliwingman.client;
 import com.mcheliwingman.network.PacketMissionAction;
 import com.mcheliwingman.network.PacketRouteAction;
 import com.mcheliwingman.network.WingmanNetwork;
+import com.mcheliwingman.network.PacketPlannerData.MarkerDto;
 import com.mcheliwingman.network.PacketPlannerData.UavDto;
 import com.mcheliwingman.network.PacketPlannerData.RouteDto;
 import net.minecraft.client.gui.GuiButton;
@@ -24,8 +25,10 @@ public class GuiWingmanPlanner extends GuiScreen {
     private static final int PANEL_W     = 230;
     private static final int GAP         = 20;
 
-    private final List<UavDto>   uavs;
-    private final List<RouteDto> routes;
+    private final List<UavDto>    uavs;
+    private final List<RouteDto>  routes;
+    private final List<MarkerDto> markers;
+    private final double playerX, playerY, playerZ;
 
     private int selUav   = -1;
     private int selRoute = -1;
@@ -40,9 +43,14 @@ public class GuiWingmanPlanner extends GuiScreen {
     // computed layout
     private int panelTop, uavX, routeX;
 
-    public GuiWingmanPlanner(List<UavDto> uavs, List<RouteDto> routes) {
-        this.uavs   = uavs;
-        this.routes = routes;
+    public GuiWingmanPlanner(List<UavDto> uavs, List<RouteDto> routes, List<MarkerDto> markers,
+                             double playerX, double playerY, double playerZ) {
+        this.uavs    = uavs;
+        this.routes  = routes;
+        this.markers = markers;
+        this.playerX = playerX;
+        this.playerY = playerY;
+        this.playerZ = playerZ;
     }
 
     @Override
@@ -208,7 +216,7 @@ public class GuiWingmanPlanner extends GuiScreen {
                 }
                 break;
             case BTN_NEW:
-                mc.displayGuiScreen(new GuiNewRoute(this, routes));
+                mc.displayGuiScreen(new GuiNewRoute(this, routes, markers, playerX, playerY, playerZ));
                 break;
             case BTN_DELETE:
                 if (selRoute >= 0) {
