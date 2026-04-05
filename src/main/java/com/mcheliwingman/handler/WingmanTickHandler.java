@@ -398,7 +398,7 @@ public class WingmanTickHandler {
                 applySlotBoost(wingman, fdx, fdy, fdz, distToSlot, leaderSpeed);
             }
 
-            syncGear(wingman, entry.leader);
+            if (entry.leader != null) syncGear(wingman, entry.leader);
         }
     }
 
@@ -460,6 +460,7 @@ public class WingmanTickHandler {
      * クリアランス半径 = max(formationSideDist, formationRearDist) / 2
      */
     private double[] applyLeaderClearance(double[] movTarget, Entity leader) {
+        if (leader == null) return movTarget;
         double clearance = Math.max(WingmanConfig.formationSideDist, WingmanConfig.formationRearDist);
         if (clearance <= 0) return movTarget;
         double ldx = movTarget[0] - leader.posX;
