@@ -670,16 +670,23 @@ public class WingmanCommand extends CommandBase {
         WorldServer ws = (WorldServer) player.world;
         PacketPlannerData pkt = new PacketPlannerData();
 
-        // Collect UAVs
-        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
-            WingmanEntry entry = e.getValue();
-            Entity entity = ws.getEntityFromUuid(e.getKey());
+        // Collect ALL McHeli aircraft in the loaded world
+        Map<UUID, WingmanEntry> registry = WingmanRegistry.snapshot();
+        for (Entity entity : new ArrayList<>(ws.loadedEntityList)) {
+            if (!McheliReflect.isAircraft(entity)) continue;
+            WingmanEntry entry = registry.get(entity.getUniqueID());
             PacketPlannerData.UavDto dto = new PacketPlannerData.UavDto();
-            dto.uuid = e.getKey().toString();
+            dto.uuid = entity.getUniqueID().toString();
             dto.name = getAircraftTypeName(entity);
-            dto.state = entry.isAutonomous() ? entry.autoState.name() : (entry.leader != null ? "FOLLOWING" : "IDLE");
-            dto.nodeIdx = entry.missionIndex;
-            dto.nodeCount = (entry.mission != null) ? entry.mission.size() : 0;
+            if (entry == null) {
+                dto.state = "UNASSIGNED";
+                dto.nodeIdx = 0;
+                dto.nodeCount = 0;
+            } else {
+                dto.state = entry.isAutonomous() ? entry.autoState.name() : (entry.leader != null ? "FOLLOWING" : "IDLE");
+                dto.nodeIdx = entry.missionIndex;
+                dto.nodeCount = (entry.mission != null) ? entry.mission.size() : 0;
+            }
             pkt.uavs.add(dto);
         }
 
