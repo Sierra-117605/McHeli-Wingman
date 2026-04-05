@@ -517,10 +517,13 @@ public class WingmanCommand extends CommandBase {
                 com.mcheliwingman.block.WingmanMarkerTileEntity wte2 =
                     (com.mcheliwingman.block.WingmanMarkerTileEntity) te2;
                 wte2.setMarkerType(newType);
+                if (wte2.getMarkerId().isEmpty()) {
+                    wte2.setMarkerId(com.mcheliwingman.block.WingmanMarkerBlock.autoId(ws, newType));
+                }
                 com.mcheliwingman.registry.MarkerRegistry.register(ws, bp2, wte2);
                 player.sendMessage(new TextComponentString(
                     "§aMarker type set to " + newType.displayName()
-                    + " §7id=" + (wte2.getMarkerId().isEmpty() ? "(none)" : wte2.getMarkerId())));
+                    + " §7id=§e" + wte2.getMarkerId()));
                 break;
             }
             default:

@@ -43,11 +43,14 @@ public class WingmanMarkerBlock extends Block {
             // Shift+右クリック: モード切り替え
             MarkerType next = te.getMarkerType().next();
             te.setMarkerType(next);
+            if (te.getMarkerId().isEmpty()) {
+                te.setMarkerId(autoId(world, next));
+            }
             // レジストリ更新
             MarkerRegistry.register(world, pos, te);
             player.sendMessage(new TextComponentString(
                 "§7Marker mode: " + next.displayName()
-                + " §7id=§f" + (te.getMarkerId().isEmpty() ? "(none)" : te.getMarkerId())));
+                + " §7id=§e" + te.getMarkerId()));
         } else {
             // 右クリック: 現在の情報表示
             player.sendMessage(new TextComponentString(
@@ -73,7 +76,7 @@ public class WingmanMarkerBlock extends Block {
         }
     }
 
-    private static String autoId(World world, MarkerType type) {
+    public static String autoId(World world, MarkerType type) {
         String prefix;
         switch (type) {
             case PARKING:  prefix = "p";  break;
