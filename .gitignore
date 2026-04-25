@@ -1,0 +1,31 @@
+# Gradle
+.gradle/
+build/
+run/
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# IntelliJ
+.idea/
+*.iml
+out/
+
+# Forge generated
+forge*.zip
+forge*.jar
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local jar dependencies (place manually in libs/)
+libs/*.jar
+
+# McHeli decompiled sources and assets (dependency, not our code)
+mcheli/
+net/
+assets/

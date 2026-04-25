@@ -1,0 +1,12 @@
+[
+  {
+    "modid": "mcheliwingman",
+    "name": "McHeli Wingman",
+    "description": "Formation flight, target sharing, autonomous attack and RTB for McHeli CE UAVs.",
+    "version": "${version}",
+    "mcversion": "${mcversion}",
+    "url": "",
+    "authorList": [],
+    "dependencies": ["mcheli"]
+  }
+]

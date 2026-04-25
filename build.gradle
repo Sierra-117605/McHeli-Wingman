@@ -1,0 +1,66 @@
+buildscript {
+    repositories {
+        mavenLocal()
+        jcenter()
+        maven { url = "https://files.minecraftforge.net/maven" }
+        maven { url = "https://maven.minecraftforge.net/" }
+    }
+    dependencies {
+        classpath 'net.minecraftforge.gradle:ForgeGradle:2.3-20190910.005614-43'
+    }
+}
+
+apply plugin: 'net.minecraftforge.gradle.forge'
+
+version = "1.0.0"
+group = "com.mcheliwingman"
+archivesBaseName = "McHeliWingman"
+
+sourceCompatibility = targetCompatibility = '1.8'
+
+compileJava.options.encoding = 'UTF-8'
+
+minecraft {
+    version = "1.12.2-14.23.5.2847"
+    runDir = "run"
+    mappings = "stable_39"
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    maven { url = "https://files.minecraftforge.net/maven" }
+    maven { url = "https://maven.minecraftforge.net/" }
+}
+
+dependencies {
+    // McHeli CE jar (place in libs/)
+    compile files('libs/mcheli-1.1.4.jar')
+}
+
+processResources {
+    inputs.property "version", project.version
+    inputs.property "mcversion", project.minecraft.version
+
+    from(sourceSets.main.resources.srcDirs) {
+        include 'mcmod.info'
+        expand 'version': project.version, 'mcversion': project.minecraft.version
+    }
+
+    from(sourceSets.main.resources.srcDirs) {
+        exclude 'mcmod.info'
+    }
+}
+
+jar {
+    manifest {
+        attributes([
+            "Specification-Title"          : "McHeliWingman",
+            "Specification-Version"        : "1",
+            "Implementation-Title"         : project.name,
+            "Implementation-Version"       : project.version,
+            "FMLCorePlugin"                : "com.mcheliwingman.asm.WingmanPlugin",
+            "FMLCorePluginContainsFMLMod"  : "true"
+        ])
+    }
+}

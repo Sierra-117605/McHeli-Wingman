@@ -1,0 +1,1187 @@
+package com.mcheliwingman.handler;
+
+import com.mcheliwingman.McHeliWingman;
+import com.mcheliwingman.config.WingmanConfig;
+import com.mcheliwingman.mission.AutonomousState;
+import com.mcheliwingman.wingman.WingmanEntry;
+import com.mcheliwingman.wingman.WingmanRegistry;
+import com.mcheliwingman.wingman.WingmanState;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.monster.IMob;
+import net.minecraft.network.datasync.DataParameter;
+import net.minecraft.world.WorldServer;
+import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
+import net.minecraftforge.fml.common.gameevent.TickEvent;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * Per-tick wingman logic.
+ *
+ * 設計方針:
+ *   機体本来の飛行物理（McHeli）を尊重し、setRotYaw/setRotPitch をレート制限付きで操作して誘導する。
+ *   velocity/motion は直接書き換えない。
+ *
+ * Phase.START: エンジン・姿勢角セット（McHeli更新前）
+ * Phase.END  : 攻撃発射・ギア同期
+ */
+public class WingmanTickHandler {
+
+    // 到達判定距離
+    private static final double ARRIVAL_THRESHOLD = 5.0;
+    // 停止ホールド判定距離（親機停止時にこの距離以内なら停止待機）
+    private static final double HOLD_THRESHOLD = 25.0;
+    // 親機停止判定速度（ブロック/tick）
+    private static final double LEADER_STOP_SPEED = 0.4;
+    // 自動攻撃索敵レンジ
+    private static final double AUTO_ATTACK_RANGE = 200.0;
+    // 発射後の逃避時間（tick）— この間は現在ヨーを維持してエスケープ
+    private static final int POST_FIRE_ESCAPE_TICKS = 40;
+
+    // 武器種別スタンドオフ距離（接敵目標水平距離）— 近づき過ぎない
+    private static double standoffForWeapon(String type) {
+        if (type == null) return 120.0;
+        switch (type.toLowerCase()) {
+            case "gun": case "machinegun": case "machinegun1": case "machinegun2":
+            case "cannon":                return 80.0;
+            case "cas":                   return 100.0;
+            case "rocket": case "mkrocket": return 150.0;
+            case "missile": case "aamissile": case "atmissile": case "tvmissile":
+                                          return 250.0;
+            case "asmissile":             return 300.0;
+            case "bomb":                  return 200.0;   // 爆弾は特に離す
+            case "torpedo":               return 40.0;
+            default:                      return 120.0;
+        }
+    }
+
+    // 武器種別高度オフセット（ターゲットY + この値 が目標高度）
+    private static double altOffsetForWeapon(String type) {
+        if (type == null) return 50.0;
+        switch (type.toLowerCase()) {
+            case "gun": case "machinegun": case "machinegun1": case "machinegun2":
+            case "cannon":   return 40.0;
+            case "cas":      return 50.0;
+            case "rocket": case "mkrocket": return 60.0;
+            case "missile": case "aamissile": case "atmissile": case "tvmissile":
+                             return 80.0;
+            case "asmissile": return 200.0;
+            case "bomb":     return 200.0;   // 十分な高度から投下
+            case "torpedo":  return 5.0;
+            default:         return 50.0;
+        }
+    }
+
+    // 武器種別発射有効レンジ（この距離以内で発射）
+    private static double fireRangeForWeapon(String type) {
+        if (type == null) return 150.0;
+        switch (type.toLowerCase()) {
+            case "gun": case "machinegun": case "machinegun1": case "machinegun2":
+            case "cannon":   return 120.0;
+            case "cas":      return 140.0;
+            case "rocket": case "mkrocket": return 200.0;
+            case "missile": case "aamissile": case "atmissile": case "tvmissile":
+                             return 300.0;
+            case "asmissile": return 380.0;
+            case "bomb":     return 350.0;
+            case "torpedo":  return 80.0;
+            default:         return 150.0;
+        }
+    }
+
+    // 武器種別クールダウン(tick)
+    private static int fireCooldownForType(String type) {
+        if (type == null) return 10;
+        switch (type.toLowerCase()) {
+            case "gun": case "machinegun": case "machinegun1": case "machinegun2": return 2;
+            case "cas":      return 3;
+            case "cannon":   return 5;
+            case "rocket": case "mkrocket": return 10;
+            case "aamissile": case "atmissile": case "missile": return 20;
+            case "asmissile": return 60;   // 対地ミサイルは1発打ったら間隔を広く
+            case "tvmissile": return 30;
+            case "bomb":     return 80;    // 爆弾は爆発回避のため間隔を大きく
+            case "torpedo":  return 30;
+            default:         return 10;
+        }
+    }
+
+    // 旋回レート制限 (°/tick) — 固定翼は緩やかに、ヘリは機動性高め
+    private static final float MAX_YAW_RATE_PLANE = 3.0f;
+    private static final float MAX_YAW_RATE_HELI  = 4.0f;
+    // ピッチレート制限 (°/tick)
+    private static final float MAX_PITCH_RATE = 3.0f;
+    // ロール（バンク角）レート制限 (°/tick)
+    private static final float MAX_ROLL_RATE = 5.0f;
+    // 最大ピッチ角
+    private static final float MAX_PITCH_UP   = 25.0f;
+    private static final float MAX_PITCH_DOWN = -20.0f;
+
+    // ─── Reflection caches ───────────────────────────────────────────────────
+
+    // Throttle
+    private Method   setCurrentThrottleMethod;
+    private Method   getCurrentThrottleMethod;
+    private Field    throttleDataParamField;
+    private boolean  throttleResolved = false;
+
+    // 直接回転制御メソッド（UAV無ライダーでも機能）
+    private Method   setRotYawMethod, setRotPitchMethod, setRotRollMethod;
+    private Method   getRotRollMethod;
+    private boolean  rotationResolved = false;
+
+    // 攻撃エイム用フィールド
+    private Field    lastRiderYawField, lastRiderPitchField;
+    private boolean  controlResolved = false;
+
+    // getRotYaw/getRotPitch（現在の機体角度取得用）
+    private Method   getRotYawMethod, getRotPitchMethod;
+
+    // Gear
+    private Method   isLandingGearFolded, foldLandingGear, unfoldLandingGear, canFoldLandingGear;
+
+    // VTOL制御（固定翼機）
+    private Method   getVtolModeMethod, swithVtolModeMethod;
+    private boolean  vtolResolved = false;
+
+    // Weapons
+    private Field    weaponsField;
+    private Class<?> weaponParamClass;
+    private Constructor<?> weaponParamCtor;
+    private Field    wpUser, wpPosX, wpPosY, wpPosZ, wpRotYaw, wpRotPitch, wpEntity;
+    private Method   weaponSetUse, weaponSetCanUse, weaponSetGetCurrentWeapon, weaponBaseShot;
+    private boolean  weaponDebugLogged = false;
+    private Field    lastRiddenByEntityField;
+
+    // ファイアレートの自前管理
+    private final java.util.Map<UUID, Integer> fireCooldowns = new java.util.HashMap<>();
+    // 発射後エスケープカウンタ（残りtick > 0 中は現在ヨーを維持してエスケープ飛行）
+    private final java.util.Map<UUID, Integer> postFireEscape = new java.util.HashMap<>();
+    // デバッグログ抑制カウンタ（20tickに1回だけ出力）
+    private int boostDebugTick = 0;
+
+    // ─── Phase.START ─────────────────────────────────────────────────────────
+
+    @SubscribeEvent
+    public void onWorldTickStart(TickEvent.WorldTickEvent event) {
+        if (event.world.isRemote || event.phase != TickEvent.Phase.START) return;
+        WorldServer ws = (WorldServer) event.world;
+
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            Entity wingman = ws.getEntityFromUuid(e.getKey());
+            if (wingman == null || wingman.isDead) continue;
+            WingmanEntry entry = e.getValue();
+
+            // 固定翼: VTOLモードを強制OFF
+            if (!isHelicopter(wingman)) {
+                forceVtolOff(wingman);
+            }
+
+            if (entry.attackMode != WingmanEntry.ATK_NONE) {
+                // 攻撃中: 全力スロットル
+                maintainEngine(wingman, 1.0);
+                steerToTarget(ws, wingman, entry);
+            } else if (entry.isAutonomous()) {
+                // 自律飛行中: AutonomousFlightHandlerが設定した目標へ全力追従
+                double dx = entry.autoTargetX - wingman.posX;
+                double dy = entry.autoTargetY - wingman.posY;
+                double dz = entry.autoTargetZ - wingman.posZ;
+                double distToTarget = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                maintainEngine(wingman, distToTarget > 20 ? 1.0 : 0.5);
+                steerToTarget(ws, wingman, entry);
+            } else if (entry.leader != null) {
+                // フォーメーション追従: 指定スロットまでの距離に応じてスロットル調整
+                double[] fp = formationPos(entry.leader, entry.formationSlot);
+                double dx = fp[0] - wingman.posX;
+                double dy = fp[1] - wingman.posY;
+                double dz = fp[2] - wingman.posZ;
+                double distToSlot = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (isLeaderStopped(entry.leader) && distToSlot < HOLD_THRESHOLD) {
+                    holdStop(wingman, entry.leader);
+                } else {
+                    maintainEngineAdaptive(wingman, entry.leader, distToSlot);
+                    steerToTarget(ws, wingman, entry);
+                }
+            }
+        }
+    }
+
+    /**
+     * McHeliの飛行物理を尊重した操縦制御。
+     *
+     * McHeli内部: onUpdate_Server は getRotYaw()/getRotPitch() を使って速度ベクトルを更新する。
+     * ライダーなしUAVでは setAngles() が呼ばれないため lastRiderYaw/moveLeft 等は効果なし。
+     * → setRotYaw / setRotPitch を直接レート制限付きで書き換えることで機体を誘導する。
+     */
+    private void steerToTarget(WorldServer ws, Entity wingman, WingmanEntry entry) {
+        resolveRotationMethods(wingman);
+        resolveControlFields(wingman);  // lastRiderYaw は攻撃エイム用に残す
+
+        // 発射後エスケープ中は現在ヨーを維持（旋回しない）
+        UUID wid = wingman.getUniqueID();
+        int escTicks = postFireEscape.getOrDefault(wid, 0);
+        if (escTicks > 0) {
+            postFireEscape.put(wid, escTicks - 1);
+            return;  // ヨー/ピッチ変更なし → 直進エスケープ
+        }
+
+        double[] movTarget = computeMoveTarget(ws, wingman, entry);
+        double[] aimTarget = computeAimTarget(ws, wingman, entry);
+        double[] aimRef    = (aimTarget != null) ? aimTarget : movTarget;
+
+        boolean heli = isHelicopter(wingman);
+        boolean inAttack = (entry.attackMode != WingmanEntry.ATK_NONE);
+        // 攻撃中は旋回レートを高めてスピード感ある機動に
+        float maxYawRate = inAttack
+            ? (heli ? 6.0f : 3.0f)
+            : (heli ? MAX_YAW_RATE_HELI : MAX_YAW_RATE_PLANE);
+
+        // 現在の機体角度を取得
+        float currentYaw   = getCurrentRotYaw(wingman);
+        float currentPitch = getCurrentRotPitch(wingman);
+
+        if (aimRef != null) {
+            double dx = aimRef[0] - wingman.posX;
+            double dz = aimRef[2] - wingman.posZ;
+            double dy = aimRef[1] - wingman.posY;
+
+            // ─── Yaw: 常にターゲット方向へ機体を向ける ───────────────────
+            float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+
+            // フォーメーション追従中: スロットに近いほどリーダーのヨーに追随する。
+            // スロットが旋回で動くたびに向き直すジグザグを防ぎ、
+            // リーダーのロールとほぼ同調した自然な旋回を実現する。
+            if (!inAttack && !entry.isAutonomous() && entry.leader != null) {
+                double hDistToSlot = Math.sqrt(dx * dx + dz * dz);
+                // alpha: 0(スロット密着)→1(30ブロック以上離れている)
+                float alpha = (float) Math.min(1.0, hDistToSlot / 30.0);
+                float leaderYaw = entry.leader.rotationYaw;
+                float diff = targetYaw - leaderYaw;
+                while (diff >  180f) diff -= 360f;
+                while (diff < -180f) diff += 360f;
+                // 近い: リーダーのヨー基準に微補正 / 遠い: スロット方向へ全力
+                targetYaw = leaderYaw + diff * alpha;
+            }
+
+            float yawDiff = targetYaw - currentYaw;
+            while (yawDiff >  180f) yawDiff -= 360f;
+            while (yawDiff < -180f) yawDiff += 360f;
+            float yawStep = Math.max(-maxYawRate, Math.min(maxYawRate, yawDiff));
+            setRotYaw(wingman, currentYaw + yawStep);
+            try { if (lastRiderYawField != null) lastRiderYawField.setFloat(wingman, targetYaw); }
+            catch (Exception ignored) {}
+
+            // ─── Roll: フォーメーション追従中はリーダーのロール角に追随 ──
+            if (!inAttack && !entry.isAutonomous() && entry.leader != null) {
+                float leaderRoll  = getCurrentRotRoll(entry.leader);
+                float currentRoll = getCurrentRotRoll(wingman);
+                float rollDiff    = leaderRoll - currentRoll;
+                while (rollDiff >  180f) rollDiff -= 360f;
+                while (rollDiff < -180f) rollDiff += 360f;
+                float rollStep = Math.max(-MAX_ROLL_RATE, Math.min(MAX_ROLL_RATE, rollDiff));
+                setRotRoll(wingman, currentRoll + rollStep);
+            }
+
+            // ─── Pitch ───────────────────────────────────────────────────
+            double hDist = Math.sqrt(dx * dx + dz * dz);
+            // 固定砲（gun/cannon/cas）: 機首ごとターゲットに向ける
+            // それ以外の武器（missile/bomb等）: 機体は水平維持、lastRiderPitchでエイム
+            boolean fixedGun = inAttack && isFixedGunWeapon(entry.weaponType);
+
+            float targetPitch;
+            if (fixedGun) {
+                // 機首でターゲットに直接エイム
+                targetPitch = (float) -Math.toDegrees(Math.atan2(dy, Math.max(hDist, 1.0)));
+                targetPitch = Math.max(MAX_PITCH_DOWN, Math.min(MAX_PITCH_UP, targetPitch));
+            } else {
+                // 高度維持ピッチ（movTargetのY座標に向かう分だけ）
+                // aimTargetのdyではなくmovTargetのdyで計算して機体を水平に保つ
+                double movDy = (movTarget != null) ? (movTarget[1] - wingman.posY) : dy;
+                if (heli) {
+                    targetPitch = (float) -Math.toDegrees(Math.atan2(movDy, Math.max(hDist, 0.1)));
+                    targetPitch = Math.max(-20f, Math.min(20f, targetPitch));
+                } else {
+                    targetPitch = (float) -Math.toDegrees(Math.atan2(movDy, Math.max(hDist, 1.0)));
+                    targetPitch = Math.max(MAX_PITCH_DOWN, Math.min(MAX_PITCH_UP, targetPitch));
+                }
+            }
+            float pitchStep = Math.max(-MAX_PITCH_RATE, Math.min(MAX_PITCH_RATE, targetPitch - currentPitch));
+            setRotPitch(wingman, currentPitch + pitchStep);
+
+            // lastRiderPitch: 攻撃中は武器エイム用に実際のターゲットへの角度を渡す
+            float aimPitch = (float) -Math.toDegrees(Math.atan2(dy, Math.max(hDist, 1.0)));
+            try { if (lastRiderPitchField != null) lastRiderPitchField.setFloat(wingman, aimPitch); }
+            catch (Exception ignored) {}
+        }
+
+        // 他の子機との分離（formationSideDist を最小間隔として反発ヨー補正）
+        applySiblingRepulsion(wingman, entry, currentYaw, maxYawRate);
+    }
+
+    /**
+     * 同一リーダーの他の子機が近すぎる場合、反発方向にヨーをオフセットする。
+     * 最小間隔 = formationSideDist（0の場合は formationRearDist を使用）。
+     */
+    private void applySiblingRepulsion(Entity wingman, WingmanEntry entry, float currentYaw, float maxYawRate) {
+        double minDist = WingmanConfig.formationSideDist > 0
+                ? WingmanConfig.formationSideDist
+                : WingmanConfig.formationRearDist;
+        if (minDist <= 0) return;
+
+        double repX = 0, repZ = 0;
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            if (e.getKey().equals(wingman.getUniqueID())) continue;
+            WingmanEntry other = e.getValue();
+            if (other.leader != entry.leader) continue;
+            // 他の子機のエンティティをワールドから取得
+            Entity sibling = wingman.world.loadedEntityList.stream()
+                    .filter(en -> en.getUniqueID().equals(e.getKey()))
+                    .findFirst().orElse(null);
+            if (sibling == null) continue;
+            double sdx = wingman.posX - sibling.posX;
+            double sdz = wingman.posZ - sibling.posZ;
+            double dist = Math.sqrt(sdx * sdx + sdz * sdz);
+            if (dist < minDist && dist > 0.01) {
+                // 近すぎる: 離れる方向に反発ベクトルを積算（距離に反比例）
+                double strength = (minDist - dist) / minDist;
+                repX += (sdx / dist) * strength;
+                repZ += (sdz / dist) * strength;
+            }
+        }
+
+        if (repX == 0 && repZ == 0) return;
+        float repYaw = (float) Math.toDegrees(Math.atan2(-repX, repZ));
+        float yawDiff = repYaw - currentYaw;
+        while (yawDiff >  180f) yawDiff -= 360f;
+        while (yawDiff < -180f) yawDiff += 360f;
+        // 反発は最大yawRateの半分だけ補正（通常の追従を阻害しないよう控えめに）
+        float repStep = Math.max(-maxYawRate * 0.5f, Math.min(maxYawRate * 0.5f, yawDiff));
+        setRotYaw(wingman, currentYaw + repStep);
+    }
+
+    /** 機首方向固定の直射武器（gun/cannon/cas）か判定。これ以外はフリールック可能とみなす。 */
+    private static boolean isFixedGunWeapon(String type) {
+        if (type == null) return false;
+        switch (type.toLowerCase()) {
+            case "gun": case "machinegun": case "machinegun1": case "machinegun2":
+            case "cannon": case "cas":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // ─── Phase.END ───────────────────────────────────────────────────────────
+
+    @SubscribeEvent
+    public void onWorldTickEnd(TickEvent.WorldTickEvent event) {
+        if (event.world.isRemote || event.phase != TickEvent.Phase.END) return;
+        WorldServer ws = (WorldServer) event.world;
+
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            UUID id = e.getKey();
+            WingmanEntry entry = e.getValue();
+
+            // 自律機はleaderがなくても継続。通常follower機はleader死亡で解除。
+            if (!entry.isAutonomous() && (entry.leader == null || entry.leader.isDead)) {
+                WingmanRegistry.remove(id);
+                McHeliWingman.logger.info("[Wingman] {} unregistered — leader gone", id);
+                continue;
+            }
+
+            Entity wingman = ws.getEntityFromUuid(id);
+            if (wingman == null || wingman.isDead) continue;
+
+            // 攻撃: 発射のみ（移動はSTARTで処理済み）
+            if (entry.attackMode != WingmanEntry.ATK_NONE) {
+                Entity target = resolveTarget(ws, wingman, entry);
+                if (target != null && !target.isDead) {
+                    double dx   = target.posX - wingman.posX;
+                    double dy   = (target.posY + 1.5) - wingman.posY;
+                    double dz   = target.posZ - wingman.posZ;
+                    double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    float  yaw  = (float) Math.toDegrees(Math.atan2(-dx, dz));
+                    float  hd   = (float) Math.sqrt(dx * dx + dz * dz);
+                    float  pitch = (float) -Math.toDegrees(Math.atan2(dy, hd));
+                    if (dist <= fireRangeForWeapon(entry.weaponType)) {
+                        tryFire(wingman, entry.leader, target, yaw, pitch, entry.weaponType);
+                    }
+                }
+            }
+
+            // スロット追従ブースト（編隊追従時のみ、McHeli物理更新後にpos加算）
+            if (entry.attackMode == WingmanEntry.ATK_NONE && !entry.isAutonomous()
+                    && entry.leader != null && !isLeaderStopped(entry.leader)) {
+                double[] fp = formationPos(entry.leader, entry.formationSlot);
+                double fdx = fp[0] - wingman.posX;
+                double fdy = fp[1] - wingman.posY;
+                double fdz = fp[2] - wingman.posZ;
+                double distToSlot = Math.sqrt(fdx * fdx + fdy * fdy + fdz * fdz);
+                double leaderSpeed = Math.sqrt(
+                    entry.leader.motionX * entry.leader.motionX +
+                    entry.leader.motionY * entry.leader.motionY +
+                    entry.leader.motionZ * entry.leader.motionZ);
+                applySlotBoost(wingman, fdx, fdy, fdz, distToSlot, leaderSpeed);
+            }
+
+            if (entry.leader != null) {
+                syncGear(wingman, entry.leader);
+            } else if (entry.isAutonomous()) {
+                // 自律飛行中: autoState に応じてギアを自動制御
+                autoGear(wingman, entry.autoState);
+            }
+        }
+    }
+
+    // ─── Target computation ──────────────────────────────────────────────────
+
+    /** 移動目標座標。武器種別高度オフセット・スタンドオフ込み。 */
+    private double[] computeMoveTarget(WorldServer ws, Entity wingman, WingmanEntry entry) {
+        if (entry.attackMode != WingmanEntry.ATK_NONE) {
+            Entity target = resolveTarget(ws, wingman, entry);
+            if (target != null && !target.isDead) {
+                double standoff  = standoffForWeapon(entry.weaponType);
+                double altOffset = altOffsetForWeapon(entry.weaponType);
+                double dx    = target.posX - wingman.posX;
+                double dz    = target.posZ - wingman.posZ;
+                double hDist = Math.sqrt(dx * dx + dz * dz);
+                double idealTY = target.posY + altOffset;
+                // 攻撃高度フロア/シーリング（/wingman minalt・maxalt で設定、0=無効）
+                if (WingmanConfig.minAttackAltitude > 0)
+                    idealTY = Math.max(idealTY, WingmanConfig.minAttackAltitude);
+                if (WingmanConfig.maxAttackAltitude > 0)
+                    idealTY = Math.min(idealTY, WingmanConfig.maxAttackAltitude);
+
+                double[] raw;
+                if (hDist > standoff) {
+                    // スタンドオフ距離まで接近
+                    double ratio = (hDist - standoff) / hDist;
+                    raw = new double[]{
+                        wingman.posX + dx * ratio,
+                        idealTY,
+                        wingman.posZ + dz * ratio
+                    };
+                } else {
+                    // スタンドオフ圏内: ターゲットから離れる方向に逃げる
+                    double norm = Math.max(hDist, 0.1);
+                    raw = new double[]{
+                        target.posX + (-dx / norm) * standoff * 1.5,
+                        idealTY,
+                        target.posZ + (-dz / norm) * standoff * 1.5
+                    };
+                }
+
+                // リーダーとの最小クリアランス（Side/Rear の小さい方を半径とする）
+                raw = applyLeaderClearance(raw, entry.leader);
+                return raw;
+            }
+        }
+        // 自律飛行中: AutonomousFlightHandlerが設定した目標座標を使う
+        if (entry.isAutonomous()) {
+            return new double[]{ entry.autoTargetX, entry.autoTargetY, entry.autoTargetZ };
+        }
+        if (entry.state == WingmanState.FOLLOWING && entry.leader != null) {
+            return formationPos(entry.leader, entry.formationSlot);
+        }
+        return null;
+    }
+
+    /**
+     * 移動目標がリーダー機に近づきすぎる場合、リーダーから押し出す補正を加える。
+     * クリアランス半径 = max(formationSideDist, formationRearDist) / 2
+     */
+    private double[] applyLeaderClearance(double[] movTarget, Entity leader) {
+        if (leader == null) return movTarget;
+        double clearance = Math.max(WingmanConfig.formationSideDist, WingmanConfig.formationRearDist);
+        if (clearance <= 0) return movTarget;
+        double ldx = movTarget[0] - leader.posX;
+        double ldz = movTarget[2] - leader.posZ;
+        double hd  = Math.sqrt(ldx * ldx + ldz * ldz);
+        if (hd < clearance && hd > 0.01) {
+            // リーダーから clearance だけ離れた点に押し出す
+            double scale = clearance / hd;
+            return new double[]{
+                leader.posX + ldx * scale,
+                movTarget[1],
+                leader.posZ + ldz * scale
+            };
+        }
+        return movTarget;
+    }
+
+    /** エイム目標。攻撃中のみターゲット座標を返す。 */
+    private double[] computeAimTarget(WorldServer ws, Entity wingman, WingmanEntry entry) {
+        if (entry.attackMode == WingmanEntry.ATK_NONE) return null;
+        Entity target = resolveTarget(ws, wingman, entry);
+        if (target == null || target.isDead) return null;
+        return new double[]{target.posX, target.posY + 1.5, target.posZ};
+    }
+
+    /**
+     * フォーメーション座標。
+     *   side > 0: 通常V字/ダイヤ隊形 (rank = slot/2+1, 左右交互)
+     *   side = 0: 縦列 (slot 0 = 1×rear後方, slot N = (N+1)×rear後方, 親機と同方向)
+     */
+    private double[] formationPos(Entity leader, int slot) {
+        double sideDist = WingmanConfig.formationSideDist;
+        double altOff   = WingmanConfig.formationAltOffset;
+        double rearDist = WingmanConfig.formationRearDist;
+
+        double yawRad = Math.toRadians(leader.rotationYaw);
+        double fwdX   = -Math.sin(yawRad);
+        double fwdZ   =  Math.cos(yawRad);
+
+        if (sideDist == 0.0) {
+            // 縦列: 各機がリアに等間隔で一列
+            int rank = slot + 1;
+            return new double[]{
+                leader.posX - fwdX * rearDist * rank,
+                leader.posY + altOff,
+                leader.posZ - fwdZ * rearDist * rank
+            };
+        }
+
+        double rigX   =  Math.cos(yawRad);
+        double rigZ   =  Math.sin(yawRad);
+        int    rank     = slot / 2 + 1;
+        double sideSign = (slot % 2 == 0) ? 1.0 : -1.0;
+
+        return new double[]{
+            leader.posX + rigX * sideDist * sideSign * rank - fwdX * rearDist * rank,
+            leader.posY + altOff,
+            leader.posZ + rigZ * sideDist * sideSign * rank - fwdZ * rearDist * rank
+        };
+    }
+
+    // ─── Attack ──────────────────────────────────────────────────────────────
+
+    private Entity resolveTarget(WorldServer ws, Entity wingman, WingmanEntry entry) {
+        if (entry.attackMode == WingmanEntry.ATK_MANUAL && entry.manualTargetId != null)
+            return ws.getEntityFromUuid(entry.manualTargetId);
+        if (entry.attackMode == WingmanEntry.ATK_AUTO) {
+            java.util.Set<UUID> taken = getTargetedUUIDs(wingman.getUniqueID(), entry.leader);
+            java.util.List<Entity> siblings = getSiblings(wingman.getUniqueID(), entry.leader, wingman.world);
+            Entity target = findNearestHostile(wingman, AUTO_ATTACK_RANGE, taken, siblings);
+            entry.currentAutoTarget = (target != null) ? target.getUniqueID() : null;
+            return target;
+        }
+        return null;
+    }
+
+    private Entity findNearestHostile(Entity wingman, double range,
+                                      java.util.Set<UUID> exclude, java.util.List<Entity> siblings) {
+        double minSep = WingmanConfig.formationSideDist > 0
+                ? WingmanConfig.formationSideDist
+                : WingmanConfig.formationRearDist;
+        double bestSq = range * range;
+        Entity best   = null;
+        outer:
+        for (Entity e : wingman.world.loadedEntityList) {
+            if (e == wingman || !(e instanceof IMob) || e.isDead) continue;
+            if (exclude != null && exclude.contains(e.getUniqueID())) continue;
+            // 攻撃経路（wingman→ターゲット間の中点）が他の子機に近すぎる場合はスキップ
+            if (minSep > 0 && siblings != null) {
+                double midX = (wingman.posX + e.posX) * 0.5;
+                double midZ = (wingman.posZ + e.posZ) * 0.5;
+                for (Entity sib : siblings) {
+                    double sdx = midX - sib.posX;
+                    double sdz = midZ - sib.posZ;
+                    if (sdx * sdx + sdz * sdz < minSep * minSep) continue outer;
+                }
+            }
+            double dsq = wingman.getDistanceSq(e);
+            if (dsq < bestSq) { bestSq = dsq; best = e; }
+        }
+        return best;
+    }
+
+    /** 同一リーダーに従う他の子機エンティティリストを返す。 */
+    private java.util.List<Entity> getSiblings(UUID selfId, Entity leader, net.minecraft.world.World world) {
+        java.util.List<Entity> result = new java.util.ArrayList<>();
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            if (e.getKey().equals(selfId)) continue;
+            if (e.getValue().leader != leader) continue;
+            for (Entity en : world.loadedEntityList) {
+                if (en.getUniqueID().equals(e.getKey())) { result.add(en); break; }
+            }
+        }
+        return result;
+    }
+
+    /** 同一リーダーの他子機が攻撃中のターゲットUUIDセットを返す（分散攻撃用）。 */
+    private java.util.Set<UUID> getTargetedUUIDs(UUID selfId, Entity leader) {
+        java.util.Set<UUID> taken = new java.util.HashSet<>();
+        for (Map.Entry<UUID, WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+            if (e.getKey().equals(selfId)) continue;
+            WingmanEntry other = e.getValue();
+            if (other.leader != leader) continue;
+            if (other.attackMode == WingmanEntry.ATK_MANUAL && other.manualTargetId != null)
+                taken.add(other.manualTargetId);
+            else if (other.attackMode == WingmanEntry.ATK_AUTO && other.currentAutoTarget != null)
+                taken.add(other.currentAutoTarget);
+        }
+        return taken;
+    }
+
+    private void tryFire(Entity aircraft, Entity leader, Entity target,
+                         float yaw, float pitch, String weaponType) {
+        try {
+            resolveWeaponReflection(aircraft);
+            if (weaponsField == null || weaponParamCtor == null) return;
+
+            Object[] wps = (Object[]) weaponsField.get(aircraft);
+            if (wps == null || wps.length == 0) return;
+
+            if (!weaponDebugLogged) { weaponDebugLogged = true; logWeaponInfo(wps); }
+
+            UUID id = aircraft.getUniqueID();
+            int cd = fireCooldowns.getOrDefault(id, 0);
+            if (cd > 0) { fireCooldowns.put(id, cd - 1); return; }
+
+            Object chosen = pickWeapon(wps, weaponType, true);
+            if (chosen == null) chosen = pickWeapon(wps, weaponType, false);
+            if (chosen == null) return;
+
+            String resolvedType = resolveWeaponType(chosen, weaponType);
+
+            // 弾薬が空の場合は最大値まで補充（UAVは自律補給）
+            ensureAmmoLoaded(chosen);
+
+            // paramを複数パターンで試す（asmissileはtargetEntityがnullだとNPEになるため）
+            // パターン1: targetEntityあり、位置=aircraft
+            // パターン2: targetEntityあり、位置=target
+            // パターン3: targetEntityなし、位置=target（旧asmissile専用）
+            Object param1 = buildParamFull(aircraft, target, aircraft.posX, aircraft.posY, aircraft.posZ, yaw, pitch);
+            Object param2 = buildParamFull(aircraft, target, target.posX, target.posY, target.posZ, yaw, pitch);
+            Object param3 = buildParamFull(aircraft, null,   target.posX, target.posY, target.posZ, yaw, pitch);
+            if (param1 == null) return;
+
+            boolean fired = fireDirectShot(chosen, param1);
+            if (!fired) fired = fireDirectShot(chosen, param2);
+            if (!fired) fired = fireDirectShot(chosen, param3);
+            if (!fired) fired = fireViaUse(aircraft, leader, chosen, param1);
+            if (!fired) fired = fireViaUse(aircraft, leader, chosen, param2);
+            if (!fired) fired = fireViaUse(aircraft, leader, chosen, param3);
+
+            if (fired) {
+                int cooldown = fireCooldownForType(resolvedType);
+                fireCooldowns.put(id, cooldown);
+                // 発射後エスケープ（爆弾・ミサイル系は長め）
+                int escapeTicks = isHeavyWeapon(resolvedType) ? POST_FIRE_ESCAPE_TICKS : 0;
+                if (escapeTicks > 0) postFireEscape.put(id, escapeTicks);
+                McHeliWingman.logger.debug("[Wingman] fired type={} cooldown={} escape={}", resolvedType, cooldown, escapeTicks);
+            } else {
+                McHeliWingman.logger.debug("[Wingman] tryFire failed type={}", resolvedType);
+            }
+        } catch (Exception e) {
+            McHeliWingman.logger.warn("[Wingman] tryFire exception: {}", e.toString());
+        }
+    }
+
+    private static boolean isHeavyWeapon(String type) {
+        if (type == null) return false;
+        switch (type.toLowerCase()) {
+            case "bomb": case "asmissile": case "missile":
+            case "aamissile": case "atmissile": case "tvmissile":
+                return true;
+            default: return false;
+        }
+    }
+
+    /** 弾薬が空なら最大値まで補充する（UAV自律補給）。 */
+    private void ensureAmmoLoaded(Object weaponSet) {
+        try {
+            Method getMax = weaponSet.getClass().getMethod("getAmmoNumMax");
+            Method getNum = weaponSet.getClass().getMethod("getAmmoNum");
+            Method setNum = weaponSet.getClass().getMethod("setAmmoNum", int.class);
+            int max = (int) getMax.invoke(weaponSet);
+            if (max > 0 && (int) getNum.invoke(weaponSet) <= 0) {
+                setNum.invoke(weaponSet, max);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private Object pickWeapon(Object[] wps, String weaponType, boolean requireCanUse) {
+        for (Object ws : wps) {
+            if (ws == null) continue;
+            String t = resolveWeaponType(ws, "");
+            // dummyは常にスキップ
+            if ("dummy".equalsIgnoreCase(t)) continue;
+            // targetingpodはコマンドで明示指定された場合のみ使用
+            if ("targetingpod".equalsIgnoreCase(t) && !"targetingpod".equalsIgnoreCase(weaponType)) continue;
+            if (weaponType != null && !matchesWeaponType(ws, weaponType)) continue;
+            if (requireCanUse && weaponSetCanUse != null) {
+                try { if (!(Boolean) weaponSetCanUse.invoke(ws)) continue; }
+                catch (Exception ignored) {}
+            }
+            return ws;
+        }
+        return null;
+    }
+
+    private String resolveWeaponType(Object weaponSet, String fallback) {
+        try {
+            Object info = weaponSet.getClass().getMethod("getInfo").invoke(weaponSet);
+            if (info == null) return fallback;
+            String t = (String) info.getClass().getField("type").get(info);
+            return t != null ? t : fallback;
+        } catch (Exception e) { return fallback; }
+    }
+
+    private boolean matchesWeaponType(Object weaponSet, String expectedType) {
+        String actual = resolveWeaponType(weaponSet, null);
+        if (actual == null) return false;
+        if (expectedType.equalsIgnoreCase(actual)) return true;
+        String exp = expectedType.toLowerCase();
+        String act = actual.toLowerCase();
+        switch (exp) {
+            case "gun":       return act.contains("gun") || act.equals("cas");
+            case "cannon":    return act.contains("cannon");
+            case "missile":   return act.contains("missile");
+            case "asmissile": return act.equals("asmissile");
+            case "rocket":    return act.contains("rocket");
+            case "bomb":      return act.contains("bomb");
+            case "torpedo":   return act.contains("torpedo");
+            default:          return false;
+        }
+    }
+
+    private boolean fireDirectShot(Object weaponSet, Object param) {
+        try {
+            if (weaponSetGetCurrentWeapon == null || weaponBaseShot == null) return false;
+            Object wb = weaponSetGetCurrentWeapon.invoke(weaponSet);
+            if (wb == null) return false;
+            return Boolean.TRUE.equals(weaponBaseShot.invoke(wb, param));
+        } catch (Exception e) {
+            McHeliWingman.logger.debug("[Wingman] fireDirectShot: {}", e.toString());
+            return false;
+        }
+    }
+
+    private boolean fireViaUse(Entity aircraft, Entity leader, Object weaponSet, Object param) {
+        if (weaponSetUse == null) return false;
+        Entity prevRider = null;
+        try {
+            if (lastRiddenByEntityField != null) {
+                prevRider = (Entity) lastRiddenByEntityField.get(aircraft);
+                lastRiddenByEntityField.set(aircraft, leader);
+            }
+            return Boolean.TRUE.equals(weaponSetUse.invoke(weaponSet, param));
+        } catch (Exception e) {
+            McHeliWingman.logger.debug("[Wingman] fireViaUse: {}", e.toString());
+            return false;
+        } finally {
+            if (lastRiddenByEntityField != null) {
+                try { lastRiddenByEntityField.set(aircraft, prevRider); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private Object buildParamFull(Entity aircraft, Entity targetEntity,
+                                   double px, double py, double pz, float yaw, float pitch) {
+        try {
+            Object param = weaponParamCtor.newInstance();
+            if (wpUser   != null) wpUser.set(param, aircraft);
+            if (wpEntity != null) wpEntity.set(param, targetEntity);
+            if (wpPosX   != null) wpPosX.setDouble(param, px);
+            if (wpPosY   != null) wpPosY.setDouble(param, py);
+            if (wpPosZ   != null) wpPosZ.setDouble(param, pz);
+            if (wpRotYaw != null) wpRotYaw.setFloat(param, yaw);
+            if (wpRotPitch != null) wpRotPitch.setFloat(param, pitch);
+            return param;
+        } catch (Exception e) { return null; }
+    }
+
+    private void logWeaponInfo(Object[] wps) {
+        McHeliWingman.logger.info("[Wingman] Weapon slots: {}", wps.length);
+        for (int i = 0; i < wps.length; i++) {
+            Object ws = wps[i];
+            if (ws == null) { McHeliWingman.logger.info("[Wingman]   [{}] null", i); continue; }
+            try {
+                String name    = (String) ws.getClass().getMethod("getName").invoke(ws);
+                boolean canUse = (Boolean) ws.getClass().getMethod("canUse").invoke(ws);
+                Object info    = ws.getClass().getMethod("getInfo").invoke(ws);
+                String type    = info != null ? (String) info.getClass().getField("type").get(info) : "?";
+                boolean ridOnly = false;
+                if (info != null) try { ridOnly = info.getClass().getField("ridableOnly").getBoolean(info); } catch (Exception ignored) {}
+                McHeliWingman.logger.info("[Wingman]   [{}] name={} type={} canUse={} ridableOnly={}", i, name, type, canUse, ridOnly);
+            } catch (Exception e) {
+                McHeliWingman.logger.info("[Wingman]   [{}] error: {}", i, e.getMessage());
+            }
+        }
+    }
+
+    // ─── Engine ──────────────────────────────────────────────────────────────
+
+    // スロットルが切り替わり始める距離（ブロック）
+    private static final double THROTTLE_BLEND_FAR  = 80.0;  // この距離以上: 全力
+    private static final double THROTTLE_BLEND_NEAR = 12.0;  // この距離以下: 親機同調
+
+    // スロット追従ブースト（スロットル上限突破用motion加算）
+    // McHeliの物理更新後にmotion加算するため機体固有の速度上限を超えられる
+    // ブーストはリーダー速度×BOOST_LEADER_MULT を上限とする（動的計算）
+    // → リーダー速度 + ブースト ≒ リーダー速度×3 を実現
+    private static final double BOOST_LEADER_MULT = 2.0;  // リーダー速度に掛けた値が最大ブースト量
+    private static final double BOOST_DIST_ON  = 80.0;    // ブースト開始距離
+    private static final double BOOST_DIST_OFF = 20.0;    // ブースト終了距離（これ以下でゼロに）
+
+    /**
+     * フォーメーション追従用適応スロットル。
+     * 遠い: 全力 / 近い: 親機スロットルに同調して追い抜き防止。
+     */
+    @SuppressWarnings("unchecked")
+    private void maintainEngineAdaptive(Entity aircraft, Entity leader, double distToSlot) {
+        resolveThrottle(aircraft);
+        double leaderThrottle = getEntityThrottle(leader);
+
+        double targetThrottle;
+        if (distToSlot >= THROTTLE_BLEND_FAR) {
+            targetThrottle = 1.0;
+        } else if (distToSlot <= THROTTLE_BLEND_NEAR) {
+            targetThrottle = leaderThrottle;
+        } else {
+            double t = (distToSlot - THROTTLE_BLEND_NEAR) / (THROTTLE_BLEND_FAR - THROTTLE_BLEND_NEAR);
+            targetThrottle = leaderThrottle + t * (1.0 - leaderThrottle);
+        }
+        // 未到着時の最低スロットル: 停止中の親機でも子機は位置に向かって動き続けられる
+        double minThrottle = distToSlot > ARRIVAL_THRESHOLD ? 0.25 : 0.05;
+        targetThrottle = Math.max(minThrottle, Math.min(1.0, targetThrottle));
+
+        applyThrottle(aircraft, targetThrottle);
+    }
+
+    /**
+     * スロット追従ブースト。
+     * McHeliが物理更新でmotionを確定した後（Phase.END）に呼び出し、
+     * スロット方向へ追加velocityを加算してスロットル上限を超えた速度を実現する。
+     *
+     * ブースト量はスロットまでの距離で線形補間:
+     *   dist >= BOOST_DIST_ON  → BOOST_MAX
+     *   dist <= BOOST_DIST_OFF → 0（オーバーシュート防止）
+     */
+    /**
+     * スロット追従ブースト。
+     * 最大ブースト = leaderSpeed × BOOST_LEADER_MULT（≒ リーダー速度の3倍まで到達可能）。
+     * スロット距離でtaper: BOOST_DIST_ON以上=全力、BOOST_DIST_OFF以下=ゼロ。
+     */
+    private void applySlotBoost(Entity wingman, double fdx, double fdy, double fdz,
+                                 double distToSlot, double leaderSpeed) {
+        if (distToSlot <= BOOST_DIST_OFF) return;
+
+        double taper;
+        if (distToSlot >= BOOST_DIST_ON) {
+            taper = 1.0;
+        } else {
+            taper = (distToSlot - BOOST_DIST_OFF) / (BOOST_DIST_ON - BOOST_DIST_OFF);
+        }
+
+        double boostAmount = leaderSpeed * BOOST_LEADER_MULT * taper;
+
+        double norm = Math.max(distToSlot, 0.01);
+        double bx = (fdx / norm) * boostAmount;
+        double by = (fdy / norm) * boostAmount;
+        double bz = (fdz / norm) * boostAmount;
+
+        // motionへの加算はMcHeliが次tickに上書きするため無効。
+        // posX/Y/Zを直接加算してMcHeliの物理更新後に追加変位を与える。
+        double newX = wingman.posX + bx;
+        double newY = wingman.posY + by;
+        double newZ = wingman.posZ + bz;
+        wingman.setPosition(newX, newY, newZ);
+
+        boostDebugTick++;
+        if (boostDebugTick >= 20) {
+            boostDebugTick = 0;
+            McHeliWingman.logger.info("[Wingman/Boost] dist={} leaderSpd={} boost={} applied to pos",
+                (int)distToSlot,
+                String.format("%.3f", leaderSpeed),
+                String.format("%.3f", boostAmount));
+        }
+    }
+
+    /** 指定スロットル値を直接適用する（攻撃モード・強制指定用）。 */
+    @SuppressWarnings("unchecked")
+    private void maintainEngine(Entity aircraft, double throttle) {
+        resolveThrottle(aircraft);
+        applyThrottle(aircraft, throttle);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void applyThrottle(Entity aircraft, double throttle) {
+        try { if (setCurrentThrottleMethod != null) setCurrentThrottleMethod.invoke(aircraft, throttle); }
+        catch (Exception ignored) {}
+        try {
+            if (throttleDataParamField != null) {
+                DataParameter<Integer> p = (DataParameter<Integer>) throttleDataParamField.get(null);
+                aircraft.getDataManager().set(p, (int) (throttle * 100));
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /** McHeli aircraft の現在スロットル値を取得する。取得失敗時は 0.5 を返す。 */
+    private double getEntityThrottle(Entity entity) {
+        resolveThrottle(entity);
+        try {
+            if (getCurrentThrottleMethod != null)
+                return (Double) getCurrentThrottleMethod.invoke(entity);
+        } catch (Exception ignored) {}
+        return 0.5;
+    }
+
+    // ─── Gear ────────────────────────────────────────────────────────────────
+
+    private void syncGear(Entity wingman, Entity leader) {
+        resolveGearMethods(leader);
+        if (isLandingGearFolded == null) return;
+        try {
+            boolean lf = (boolean) isLandingGearFolded.invoke(leader);
+            boolean wf = (boolean) isLandingGearFolded.invoke(wingman);
+            boolean wc = (boolean) canFoldLandingGear.invoke(wingman);
+            if (!wc) return;
+            if (lf && !wf) foldLandingGear.invoke(wingman);
+            else if (!lf && wf) unfoldLandingGear.invoke(wingman);
+        } catch (Exception ex) {
+            McHeliWingman.logger.debug("[Wingman] syncGear: {}", ex.getMessage());
+        }
+    }
+
+    /**
+     * 自律飛行中のギア自動制御。
+     * 巡航・旋回・ダウンウィンド・ベースレグ中は格納、それ以外（地上・アプローチ・着陸）は展開。
+     */
+    private void autoGear(Entity wingman, com.mcheliwingman.mission.AutonomousState state) {
+        resolveGearMethods(wingman);
+        if (isLandingGearFolded == null || canFoldLandingGear == null) return;
+        boolean retract;
+        switch (state) {
+            case CLIMB:
+            case ENROUTE:
+            case ATTACK:
+            case LOITER:
+            case DESCEND:
+            case CIRCUIT_DOWNWIND:
+            case CIRCUIT_BASE:
+            // MissionOrder 系
+            case TRANSIT_TO:
+            case ON_STATION:
+            case STRIKE_PASS:
+            case RTB:
+                retract = true;
+                break;
+            default:  // TAXI_OUT, ALIGN, TAKEOFF_ROLL, CIRCUIT_FINAL, LANDING, TAXI_IN, PARKED など
+                retract = false;
+                break;
+        }
+        try {
+            boolean folded = (boolean) isLandingGearFolded.invoke(wingman);
+            boolean canFold = (boolean) canFoldLandingGear.invoke(wingman);
+            if (!canFold) return;
+            if (retract && !folded) foldLandingGear.invoke(wingman);
+            else if (!retract && folded) unfoldLandingGear.invoke(wingman);
+        } catch (Exception ex) {
+            McHeliWingman.logger.debug("[Wingman] autoGear: {}", ex.getMessage());
+        }
+    }
+
+    // ─── Leader / hold helpers ───────────────────────────────────────────────
+
+    private static boolean isLeaderStopped(Entity leader) {
+        double spd = Math.sqrt(
+            leader.motionX * leader.motionX +
+            leader.motionY * leader.motionY +
+            leader.motionZ * leader.motionZ);
+        return spd < LEADER_STOP_SPEED;
+    }
+
+    /** スロットルゼロで自然減速し、親機の向きに徐々に揃える（停止ホールド用）。 */
+    private void holdStop(Entity aircraft, Entity leader) {
+        resolveThrottle(aircraft);
+        applyThrottle(aircraft, 0.0);
+        // 停止中は親機と同方向を向く（地上整列）
+        resolveRotationMethods(aircraft);
+        float leaderYaw = leader.rotationYaw;
+        float childYaw  = getCurrentRotYaw(aircraft);
+        float yawDiff   = leaderYaw - childYaw;
+        while (yawDiff >  180f) yawDiff -= 360f;
+        while (yawDiff < -180f) yawDiff += 360f;
+        float yawStep = Math.max(-MAX_YAW_RATE_HELI, Math.min(MAX_YAW_RATE_HELI, yawDiff));
+        setRotYaw(aircraft, childYaw + yawStep);
+    }
+
+    // ─── Aircraft type / VTOL ────────────────────────────────────────────────
+
+    private boolean isHelicopter(Entity aircraft) {
+        try {
+            return "heli".equalsIgnoreCase((String) aircraft.getClass().getMethod("getKindName").invoke(aircraft));
+        } catch (Exception e) { return true; }
+    }
+
+    private void forceVtolOff(Entity aircraft) {
+        if (!vtolResolved) {
+            vtolResolved = true;
+            getVtolModeMethod   = findMethod(aircraft.getClass(), "getVtolMode");
+            swithVtolModeMethod = findMethod(aircraft.getClass(), "swithVtolMode", boolean.class);
+            McHeliWingman.logger.info("[Wingman] VTOL methods resolved: {}",
+                    getVtolModeMethod != null && swithVtolModeMethod != null);
+        }
+        if (getVtolModeMethod == null || swithVtolModeMethod == null) return;
+        try {
+            if ((int) getVtolModeMethod.invoke(aircraft) != 0) {
+                swithVtolModeMethod.invoke(aircraft, false);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    // ─── Reflection resolution ───────────────────────────────────────────────
+
+    private void resolveThrottle(Entity aircraft) {
+        if (throttleResolved) return;
+        throttleResolved = true;
+        setCurrentThrottleMethod = findMethod(aircraft.getClass(), "setCurrentThrottle", double.class);
+        getCurrentThrottleMethod = findMethod(aircraft.getClass(), "getCurrentThrottle");
+        throttleDataParamField   = findStaticField(aircraft.getClass(), "THROTTLE");
+        McHeliWingman.logger.info("[Wingman] Throttle resolved: set={} get={}",
+                setCurrentThrottleMethod != null, getCurrentThrottleMethod != null);
+    }
+
+    private void resolveRotationMethods(Entity entity) {
+        if (rotationResolved) return;
+        rotationResolved = true;
+        setRotYawMethod   = findMethod(entity.getClass(), "setRotYaw",   float.class);
+        setRotPitchMethod = findMethod(entity.getClass(), "setRotPitch", float.class);
+        setRotRollMethod  = findMethod(entity.getClass(), "setRotRoll",  float.class);
+        getRotYawMethod   = findMethod(entity.getClass(), "getRotYaw");
+        getRotPitchMethod = findMethod(entity.getClass(), "getRotPitch");
+        getRotRollMethod  = findMethod(entity.getClass(), "getRotRoll");
+        McHeliWingman.logger.info("[Wingman] Rotation methods: setYaw={} setPitch={} setRoll={} getYaw={} getPitch={} getRoll={}",
+                setRotYawMethod != null, setRotPitchMethod != null, setRotRollMethod != null,
+                getRotYawMethod != null, getRotPitchMethod != null, getRotRollMethod != null);
+    }
+
+    private void resolveControlFields(Entity entity) {
+        if (controlResolved) return;
+        controlResolved = true;
+        lastRiderYawField   = findField(entity.getClass(), "lastRiderYaw");
+        lastRiderPitchField = findField(entity.getClass(), "lastRiderPitch");
+        McHeliWingman.logger.info("[Wingman] Control fields: lastRiderYaw={} lastRiderPitch={}",
+                lastRiderYawField != null, lastRiderPitchField != null);
+    }
+
+    private float getCurrentRotYaw(Entity aircraft) {
+        try {
+            if (getRotYawMethod != null) return (Float) getRotYawMethod.invoke(aircraft);
+        } catch (Exception ignored) {}
+        return aircraft.rotationYaw;
+    }
+
+    private float getCurrentRotPitch(Entity aircraft) {
+        try {
+            if (getRotPitchMethod != null) return (Float) getRotPitchMethod.invoke(aircraft);
+        } catch (Exception ignored) {}
+        return aircraft.rotationPitch;
+    }
+
+    private void setRotYaw(Entity aircraft, float yaw) {
+        try {
+            if (setRotYawMethod != null) setRotYawMethod.invoke(aircraft, yaw);
+        } catch (Exception ignored) {}
+    }
+
+    private void setRotPitch(Entity aircraft, float pitch) {
+        try {
+            if (setRotPitchMethod != null) setRotPitchMethod.invoke(aircraft, pitch);
+        } catch (Exception ignored) {}
+    }
+
+    private float getCurrentRotRoll(Entity aircraft) {
+        try {
+            if (getRotRollMethod != null) return (Float) getRotRollMethod.invoke(aircraft);
+        } catch (Exception ignored) {}
+        return 0f;
+    }
+
+    private void setRotRoll(Entity aircraft, float roll) {
+        try {
+            if (setRotRollMethod != null) setRotRollMethod.invoke(aircraft, roll);
+        } catch (Exception ignored) {}
+    }
+
+    private void resolveGearMethods(Entity aircraft) {
+        if (isLandingGearFolded != null) return;
+        Class<?> cls = aircraft.getClass();
+        while (cls != null) {
+            try {
+                isLandingGearFolded = cls.getDeclaredMethod("isLandingGearFolded"); isLandingGearFolded.setAccessible(true);
+                foldLandingGear     = cls.getDeclaredMethod("foldLandingGear");     foldLandingGear.setAccessible(true);
+                unfoldLandingGear   = cls.getDeclaredMethod("unfoldLandingGear");   unfoldLandingGear.setAccessible(true);
+                canFoldLandingGear  = cls.getDeclaredMethod("canFoldLandingGear");  canFoldLandingGear.setAccessible(true);
+                McHeliWingman.logger.info("[Wingman] Gear methods resolved from {}", cls.getSimpleName());
+                return;
+            } catch (NoSuchMethodException ignored) { cls = cls.getSuperclass(); }
+        }
+    }
+
+    private void resolveWeaponReflection(Entity aircraft) {
+        if (weaponsField != null) return;
+        try {
+            weaponsField              = findField(aircraft.getClass(), "weapons");
+            weaponParamClass          = Class.forName("mcheli.weapon.MCH_WeaponParam");
+            weaponParamCtor           = weaponParamClass.getConstructor();
+            wpEntity                  = weaponParamClass.getField("entity");
+            wpUser                    = weaponParamClass.getField("user");
+            wpPosX                    = weaponParamClass.getField("posX");
+            wpPosY                    = weaponParamClass.getField("posY");
+            wpPosZ                    = weaponParamClass.getField("posZ");
+            wpRotYaw                  = weaponParamClass.getField("rotYaw");
+            wpRotPitch                = weaponParamClass.getField("rotPitch");
+            Class<?> wsClass          = Class.forName("mcheli.weapon.MCH_WeaponSet");
+            Class<?> wbClass          = Class.forName("mcheli.weapon.MCH_WeaponBase");
+            weaponSetUse              = wsClass.getMethod("use", weaponParamClass);
+            weaponSetCanUse           = wsClass.getMethod("canUse");
+            weaponSetGetCurrentWeapon = wsClass.getMethod("getCurrentWeapon");
+            weaponBaseShot            = wbClass.getMethod("shot", weaponParamClass);
+            lastRiddenByEntityField   = findField(aircraft.getClass(), "lastRiddenByEntity");
+            McHeliWingman.logger.info("[Wingman] Weapon reflection resolved. shot={} lastRiddenByEntity={}",
+                    weaponBaseShot != null, lastRiddenByEntityField != null);
+        } catch (Exception e) {
+            McHeliWingman.logger.warn("[Wingman] Weapon reflection failed: {}", e.toString());
+        }
+    }
+
+    // ─── Reflection helpers ──────────────────────────────────────────────────
+
+    private static Field findField(Class<?> cls, String name) {
+        while (cls != null) {
+            try { Field f = cls.getDeclaredField(name); f.setAccessible(true); return f; }
+            catch (NoSuchFieldException ignored) { cls = cls.getSuperclass(); }
+        }
+        return null;
+    }
+
+    private static Field findStaticField(Class<?> cls, String name) {
+        while (cls != null) {
+            try {
+                for (Field f : cls.getDeclaredFields()) {
+                    if (f.getName().equals(name) && java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                        f.setAccessible(true); return f;
+                    }
+                }
+            } catch (Exception ignored) {}
+            cls = cls.getSuperclass();
+        }
+        return null;
+    }
+
+    private static Method findMethod(Class<?> cls, String name, Class<?>... params) {
+        while (cls != null) {
+            try { Method m = cls.getDeclaredMethod(name, params); m.setAccessible(true); return m; }
+            catch (NoSuchMethodException ignored) { cls = cls.getSuperclass(); }
+        }
+        return null;
+    }
+}
