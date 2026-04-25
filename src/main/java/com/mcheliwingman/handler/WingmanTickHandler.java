@@ -111,10 +111,12 @@ public class WingmanTickHandler {
     }
 
     // 旋回レート制限 (°/tick) — 固定翼は緩やかに、ヘリは機動性高め
-    private static final float MAX_YAW_RATE_PLANE = 1.5f;
+    private static final float MAX_YAW_RATE_PLANE = 3.0f;
     private static final float MAX_YAW_RATE_HELI  = 4.0f;
     // ピッチレート制限 (°/tick)
     private static final float MAX_PITCH_RATE = 3.0f;
+    // ロール（バンク角）レート制限 (°/tick)
+    private static final float MAX_ROLL_RATE = 5.0f;
     // 最大ピッチ角
     private static final float MAX_PITCH_UP   = 25.0f;
     private static final float MAX_PITCH_DOWN = -20.0f;
@@ -128,7 +130,8 @@ public class WingmanTickHandler {
     private boolean  throttleResolved = false;
 
     // 直接回転制御メソッド（UAV無ライダーでも機能）
-    private Method   setRotYawMethod, setRotPitchMethod;
+    private Method   setRotYawMethod, setRotPitchMethod, setRotRollMethod;
+    private Method   getRotRollMethod;
     private boolean  rotationResolved = false;
 
     // 攻撃エイム用フィールド
@@ -249,6 +252,22 @@ public class WingmanTickHandler {
 
             // ─── Yaw: 常にターゲット方向へ機体を向ける ───────────────────
             float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+
+            // フォーメーション追従中: スロットに近いほどリーダーのヨーに追随する。
+            // スロットが旋回で動くたびに向き直すジグザグを防ぎ、
+            // リーダーのロールとほぼ同調した自然な旋回を実現する。
+            if (!inAttack && !entry.isAutonomous() && entry.leader != null) {
+                double hDistToSlot = Math.sqrt(dx * dx + dz * dz);
+                // alpha: 0(スロット密着)→1(30ブロック以上離れている)
+                float alpha = (float) Math.min(1.0, hDistToSlot / 30.0);
+                float leaderYaw = entry.leader.rotationYaw;
+                float diff = targetYaw - leaderYaw;
+                while (diff >  180f) diff -= 360f;
+                while (diff < -180f) diff += 360f;
+                // 近い: リーダーのヨー基準に微補正 / 遠い: スロット方向へ全力
+                targetYaw = leaderYaw + diff * alpha;
+            }
+
             float yawDiff = targetYaw - currentYaw;
             while (yawDiff >  180f) yawDiff -= 360f;
             while (yawDiff < -180f) yawDiff += 360f;
@@ -256,6 +275,17 @@ public class WingmanTickHandler {
             setRotYaw(wingman, currentYaw + yawStep);
             try { if (lastRiderYawField != null) lastRiderYawField.setFloat(wingman, targetYaw); }
             catch (Exception ignored) {}
+
+            // ─── Roll: フォーメーション追従中はリーダーのロール角に追随 ──
+            if (!inAttack && !entry.isAutonomous() && entry.leader != null) {
+                float leaderRoll  = getCurrentRotRoll(entry.leader);
+                float currentRoll = getCurrentRotRoll(wingman);
+                float rollDiff    = leaderRoll - currentRoll;
+                while (rollDiff >  180f) rollDiff -= 360f;
+                while (rollDiff < -180f) rollDiff += 360f;
+                float rollStep = Math.max(-MAX_ROLL_RATE, Math.min(MAX_ROLL_RATE, rollDiff));
+                setRotRoll(wingman, currentRoll + rollStep);
+            }
 
             // ─── Pitch ───────────────────────────────────────────────────
             double hDist = Math.sqrt(dx * dx + dz * dz);
@@ -936,6 +966,11 @@ public class WingmanTickHandler {
             case DESCEND:
             case CIRCUIT_DOWNWIND:
             case CIRCUIT_BASE:
+            // MissionOrder 系
+            case TRANSIT_TO:
+            case ON_STATION:
+            case STRIKE_PASS:
+            case RTB:
                 retract = true;
                 break;
             default:  // TAXI_OUT, ALIGN, TAKEOFF_ROLL, CIRCUIT_FINAL, LANDING, TAXI_IN, PARKED など
@@ -1017,13 +1052,15 @@ public class WingmanTickHandler {
     private void resolveRotationMethods(Entity entity) {
         if (rotationResolved) return;
         rotationResolved = true;
-        setRotYawMethod   = findMethod(entity.getClass(), "setRotYaw", float.class);
+        setRotYawMethod   = findMethod(entity.getClass(), "setRotYaw",   float.class);
         setRotPitchMethod = findMethod(entity.getClass(), "setRotPitch", float.class);
+        setRotRollMethod  = findMethod(entity.getClass(), "setRotRoll",  float.class);
         getRotYawMethod   = findMethod(entity.getClass(), "getRotYaw");
         getRotPitchMethod = findMethod(entity.getClass(), "getRotPitch");
-        McHeliWingman.logger.info("[Wingman] Rotation methods: setYaw={} setPitch={} getYaw={} getPitch={}",
-                setRotYawMethod != null, setRotPitchMethod != null,
-                getRotYawMethod != null, getRotPitchMethod != null);
+        getRotRollMethod  = findMethod(entity.getClass(), "getRotRoll");
+        McHeliWingman.logger.info("[Wingman] Rotation methods: setYaw={} setPitch={} setRoll={} getYaw={} getPitch={} getRoll={}",
+                setRotYawMethod != null, setRotPitchMethod != null, setRotRollMethod != null,
+                getRotYawMethod != null, getRotPitchMethod != null, getRotRollMethod != null);
     }
 
     private void resolveControlFields(Entity entity) {
@@ -1058,6 +1095,19 @@ public class WingmanTickHandler {
     private void setRotPitch(Entity aircraft, float pitch) {
         try {
             if (setRotPitchMethod != null) setRotPitchMethod.invoke(aircraft, pitch);
+        } catch (Exception ignored) {}
+    }
+
+    private float getCurrentRotRoll(Entity aircraft) {
+        try {
+            if (getRotRollMethod != null) return (Float) getRotRollMethod.invoke(aircraft);
+        } catch (Exception ignored) {}
+        return 0f;
+    }
+
+    private void setRotRoll(Entity aircraft, float roll) {
+        try {
+            if (setRotRollMethod != null) setRotRollMethod.invoke(aircraft, roll);
         } catch (Exception ignored) {}
     }
 

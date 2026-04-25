@@ -140,6 +140,107 @@ public class McheliReflect {
         }
     }
 
+    // ─── 燃料 ────────────────────────────────────────────────────────────────
+
+    /** 現在の燃料残量を返す（取得失敗時は -1）。 */
+    public static double getFuel(Entity aircraft) {
+        if (!isAircraft(aircraft)) return -1;
+        for (String name : new String[]{"currentFuel", "fuel", "fuelAmount"}) {
+            Object v = getFieldValue(aircraft, name);
+            if (v instanceof Number) return ((Number) v).doubleValue();
+        }
+        // フォールバック: acInfo の maxFuel をチェック
+        return -1;
+    }
+
+    /** 最大燃料を返す（取得失敗時は -1）。 */
+    public static double getMaxFuel(Entity aircraft) {
+        if (!isAircraft(aircraft)) return -1;
+        for (String name : new String[]{"maxFuel", "fuelMax", "fuelCapacity"}) {
+            Object v = getFieldValue(aircraft, name);
+            if (v instanceof Number) return ((Number) v).doubleValue();
+        }
+        // acInfo から取得を試みる
+        try {
+            java.lang.reflect.Method getAcInfo = aircraft.getClass().getMethod("getAcInfo");
+            Object acInfo = getAcInfo.invoke(aircraft);
+            if (acInfo != null) {
+                Object v = getFieldValue(acInfo, "maxFuel");
+                if (v instanceof Number) return ((Number) v).doubleValue();
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    /**
+     * 燃料が無限設定かどうかを返す。
+     * McHeli では isInfiniteFuel() メソッドまたは fuelInfinite フィールドで判定。
+     */
+    public static boolean hasInfiniteFuel(Entity aircraft) {
+        if (!isAircraft(aircraft)) return true; // 取得不能は無限扱い
+        try {
+            java.lang.reflect.Method m = aircraft.getClass().getMethod("isInfiniteFuel");
+            Object result = m.invoke(aircraft);
+            if (result instanceof Boolean) return (Boolean) result;
+        } catch (Exception ignored) {}
+        for (String name : new String[]{"infiniteFuel", "fuelInfinite", "isInfiniteFuel"}) {
+            Object v = getFieldValue(aircraft, name);
+            if (v instanceof Boolean) return (Boolean) v;
+        }
+        // maxFuel が 0 以下なら無限扱い
+        double max = getMaxFuel(aircraft);
+        return max <= 0;
+    }
+
+    // ─── 武装 ────────────────────────────────────────────────────────────────
+
+    /**
+     * 機体に搭載されている武装種別文字列のリストを返す。
+     * McHeli CE の weaponList / weaponInfoList を反射で読み取る。
+     */
+    @SuppressWarnings("unchecked")
+    public static java.util.List<String> getWeaponTypes(Entity aircraft) {
+        java.util.List<String> result = new java.util.ArrayList<>();
+        if (!isAircraft(aircraft)) return result;
+        try {
+            // 武器リストフィールド候補
+            for (String listField : new String[]{"weaponList", "weaponInfoList", "weapons"}) {
+                Object wList = getFieldValue(aircraft, listField);
+                if (wList instanceof java.util.List) {
+                    for (Object wi : (java.util.List<?>) wList) {
+                        if (wi == null) continue;
+                        // 武器情報オブジェクトの "type" フィールドを読む
+                        for (String typeField : new String[]{"type", "weaponType", "name"}) {
+                            Object t = getFieldValue(wi, typeField);
+                            if (t instanceof String && !((String) t).isEmpty()) {
+                                result.add(((String) t).toLowerCase());
+                                break;
+                            }
+                        }
+                    }
+                    if (!result.isEmpty()) return result;
+                }
+            }
+        } catch (Exception e) {
+            McHeliWingman.logger.debug("getWeaponTypes failed: {}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * 機体が指定した武装種別を搭載しているか。
+     * weaponType が null/empty なら常に true（制限なし）。
+     */
+    public static boolean hasWeapon(Entity aircraft, String weaponType) {
+        if (weaponType == null || weaponType.isEmpty()) return true;
+        java.util.List<String> types = getWeaponTypes(aircraft);
+        if (types.isEmpty()) return true; // 読み取れなければ制限なし
+        for (String t : types) {
+            if (t.equalsIgnoreCase(weaponType)) return true;
+        }
+        return false;
+    }
+
     /**
      * Sets the value of a field on an object.
      * Returns true on success.

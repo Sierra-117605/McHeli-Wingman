@@ -16,5 +16,11 @@ public enum AutonomousState {
     CIRCUIT_FINAL,    // ファイナルアプローチ（グライドスロープ降下）
     LANDING,          // 着陸滑走中（スロットルゼロ・停止待ち）
     TAXI_IN,          // 滑走路 → 駐機場 地上滑走中
-    PARKED            // 駐機中
+    PARKED,           // 駐機中
+
+    // ─── MissionOrder 系 ────────────────────────────────────────────────────
+    TRANSIT_TO,       // 任務エリアへ直行中
+    ON_STATION,       // オンステーション（CAP/CAS 旋回・護衛・偵察）
+    STRIKE_PASS,      // ストライクパス実行中
+    RTB               // 帰投中（任務エリア → 帰投基地）
 }

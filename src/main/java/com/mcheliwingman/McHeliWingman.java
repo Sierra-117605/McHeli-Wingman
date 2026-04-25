@@ -2,6 +2,7 @@ package com.mcheliwingman;
 
 import com.mcheliwingman.block.WingmanMarkerBlock;
 import com.mcheliwingman.block.WingmanMarkerTileEntity;
+import com.mcheliwingman.client.WingmanGuiHandler;
 import com.mcheliwingman.command.WingmanCommand;
 import com.mcheliwingman.config.WingmanConfig;
 import com.mcheliwingman.handler.AutonomousFlightHandler;
@@ -20,6 +21,7 @@ import net.minecraftforge.fml.common.Mod.Instance;
 import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 import net.minecraftforge.fml.common.event.FMLPreInitializationEvent;
 import net.minecraftforge.fml.common.event.FMLServerStartingEvent;
+import net.minecraftforge.fml.common.network.NetworkRegistry;
 import net.minecraftforge.fml.common.registry.ForgeRegistries;
 import org.apache.logging.log4j.Logger;
 
@@ -72,6 +74,7 @@ public class McHeliWingman {
         MinecraftForge.EVENT_BUS.register(new WingmanTickHandler());
         MinecraftForge.EVENT_BUS.register(new AutonomousFlightHandler());
         WingmanNetwork.register();
+        NetworkRegistry.INSTANCE.registerGuiHandler(instance, new WingmanGuiHandler());
         logger.info("{} initialized", NAME);
     }
 

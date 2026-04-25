@@ -1,6 +1,8 @@
 package com.mcheliwingman.block;
 
 import com.mcheliwingman.registry.MarkerRegistry;
+import com.mcheliwingman.registry.TaxiRouteRegistry;
+import com.mcheliwingman.mission.TaxiRoute;
 import net.minecraft.block.Block;
 import net.minecraft.block.material.Material;
 import net.minecraft.block.state.IBlockState;
@@ -35,30 +37,57 @@ public class WingmanMarkerBlock extends Block {
                                     EntityPlayer player, EnumHand hand,
                                     EnumFacing facing, float hitX, float hitY, float hitZ) {
         if (world.isRemote) return true;
-
         WingmanMarkerTileEntity te = getTe(world, pos);
-        if (te == null) return true;
+        if (te == null || !(player instanceof net.minecraft.entity.player.EntityPlayerMP)) return true;
+        net.minecraft.entity.player.EntityPlayerMP mp = (net.minecraft.entity.player.EntityPlayerMP) player;
 
-        if (player.isSneaking()) {
-            // Shift+右クリック: モード切り替え
-            MarkerType next = te.getMarkerType().next();
-            te.setMarkerType(next);
-            if (te.getMarkerId().isEmpty()) {
-                te.setMarkerId(autoId(world, next));
-            }
-            // レジストリ更新
-            MarkerRegistry.register(world, pos, te);
-            player.sendMessage(new TextComponentString(
-                "§7Marker mode: " + next.displayName()
-                + " §7id=§e" + te.getMarkerId()));
+        if (te.getMarkerType() == MarkerType.BASE) {
+            // BASE マーカー: 基地コンフィグGUI（タキシールート + ミッションプランナー）
+            openBaseGui(world, pos, te, mp);
         } else {
-            // 右クリック: 現在の情報表示
-            player.sendMessage(new TextComponentString(
-                "§7Wingman Marker — " + te.getMarkerType().displayName()
-                + " §7id=§f" + (te.getMarkerId().isEmpty() ? "(none — use /wingman marker id <id>)" : te.getMarkerId())
-                + " §7pos=§f" + pos.getX() + "," + pos.getY() + "," + pos.getZ()));
+            // その他のマーカー: 通常のマーカー設定GUI
+            com.mcheliwingman.network.WingmanNetwork.sendToPlayer(
+                new com.mcheliwingman.network.PacketOpenMarkerGui(
+                    pos, te.getMarkerType(), te.getMarkerId(), te.getBaseId()),
+                mp);
         }
         return true;
+    }
+
+    // ─── BASE GUI ─────────────────────────────────────────────────────────────
+
+    private static void openBaseGui(World world, BlockPos pos, WingmanMarkerTileEntity te,
+                                    net.minecraft.entity.player.EntityPlayerMP player) {
+        String baseId = te.getMarkerId(); // BASE マーカーの ID が基地 ID
+        com.mcheliwingman.network.PacketOpenBaseGui pkt =
+            new com.mcheliwingman.network.PacketOpenBaseGui(pos, baseId);
+
+        // タキシールートを収集
+        for (TaxiRoute r : TaxiRouteRegistry.getForBase(world, baseId)) {
+            com.mcheliwingman.network.PacketOpenBaseGui.RouteDto dto =
+                new com.mcheliwingman.network.PacketOpenBaseGui.RouteDto();
+            dto.routeId     = r.routeId;
+            dto.parkingId   = r.parkingId;
+            dto.runwayId    = r.runwayId;
+            dto.waypointIds.addAll(r.waypointIds);
+            pkt.routes.add(dto);
+        }
+
+        // 子マーカーを収集（PARKING / WAYPOINT / RUNWAY_A / RUNWAY_B）
+        for (MarkerRegistry.MarkerInfo m : MarkerRegistry.findChildren(world, baseId)) {
+            com.mcheliwingman.network.PacketOpenBaseGui.MarkerDto dto =
+                new com.mcheliwingman.network.PacketOpenBaseGui.MarkerDto();
+            dto.id = m.id;
+            dto.x  = m.pos.getX();
+            dto.y  = m.pos.getY();
+            dto.z  = m.pos.getZ();
+            if (m.type == MarkerType.PARKING)   pkt.parkingMarkers.add(dto);
+            else if (m.type == MarkerType.WAYPOINT) pkt.waypointMarkers.add(dto);
+            else if (m.type == MarkerType.RUNWAY_A) pkt.runwayAId = m.id;
+            else if (m.type == MarkerType.RUNWAY_B) pkt.runwayBId = m.id;
+        }
+
+        com.mcheliwingman.network.WingmanNetwork.sendToPlayer(pkt, player);
     }
 
     @Override

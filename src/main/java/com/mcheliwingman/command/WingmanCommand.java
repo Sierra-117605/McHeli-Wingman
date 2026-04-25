@@ -73,6 +73,7 @@ public class WingmanCommand extends CommandBase {
             case "marker":   executeMarker(player, args);     break;
             case "route":    executeRoute(player, args);      break;
             case "mission":  executeMission(player, server, args); break;
+            case "order":    executeOrder(player, args);           break;
             case "gui":      executeGui(player);                   break;
             default: player.sendMessage(new TextComponentString("§7Usage: " + getUsage(sender)));
         }
@@ -666,6 +667,157 @@ public class WingmanCommand extends CommandBase {
     }
 
     // =========================================================================
+    // order <dispatch|abort|status|park>  — MissionOrder 発令・管理
+    //
+    //   dispatch <uuid> <baseId> <CAP|CAS|...> <targetX> <targetZ> [options...]
+    //   abort [uuid]
+    //   status
+    //   park <uuid> <parkingId>   — 駐機スポットを手動アサイン（ミッション前準備）
+    // =========================================================================
+
+    private void executeOrder(EntityPlayerMP player, String[] args) {
+        if (args.length < 2) {
+            player.sendMessage(new TextComponentString(
+                "§7Usage: /wingman order <dispatch|abort|status|park> [args]"));
+            return;
+        }
+        WorldServer ws = (WorldServer) player.world;
+        switch (args[1].toLowerCase(Locale.ROOT)) {
+
+            case "dispatch": {
+                // /wingman order dispatch <uuid> <baseId> <types,csv> <targetX> <targetZ>
+                //   [orbitRadius] [cruiseAlt] [strikePasses] [timeLimitMin]
+                if (args.length < 7) {
+                    player.sendMessage(new TextComponentString(
+                        "§7Usage: /wingman order dispatch <uuid> <baseId> <types> <targetX> <targetZ>"
+                        + " [orbitR] [alt] [passes] [min]"));
+                    return;
+                }
+                UUID uid = parseUUID(player, args[2]);
+                if (uid == null) return;
+                Entity wingman = ws.getEntityFromUuid(uid);
+                if (wingman == null) { player.sendMessage(new TextComponentString("§cEntity not found.")); return; }
+
+                com.mcheliwingman.mission.MissionOrder order = new com.mcheliwingman.mission.MissionOrder();
+                order.baseId = args[3];
+                for (String t : args[4].split(",")) {
+                    try { order.missionTypes.add(com.mcheliwingman.mission.MissionType.valueOf(t.trim().toUpperCase())); }
+                    catch (Exception ignored) {}
+                }
+                if (order.missionTypes.isEmpty()) {
+                    player.sendMessage(new TextComponentString("§cNo valid mission types in: " + args[4]));
+                    return;
+                }
+                try {
+                    order.targetX = Double.parseDouble(args[5]);
+                    order.targetZ = Double.parseDouble(args[6]);
+                } catch (NumberFormatException ex) {
+                    player.sendMessage(new TextComponentString("§cInvalid coordinates.")); return;
+                }
+                if (args.length > 7)  try { order.orbitRadius     = Double.parseDouble(args[7]); } catch (Exception ignored) {}
+                if (args.length > 8)  try { order.cruiseAlt        = Double.parseDouble(args[8]); } catch (Exception ignored) {}
+                if (args.length > 9)  try { order.strikePasses     = Integer.parseInt(args[9]);   } catch (Exception ignored) {}
+                if (args.length > 10) try { order.timeLimitMinutes = Integer.parseInt(args[10]);  } catch (Exception ignored) {}
+
+                // デフォルト武器をミッション種別から設定
+                for (com.mcheliwingman.mission.MissionType mt : order.missionTypes) {
+                    order.weapons.addAll(mt.defaultWeapons());
+                }
+
+                com.mcheliwingman.wingman.WingmanEntry entry = WingmanRegistry.get(uid);
+                if (entry == null) {
+                    entry = new com.mcheliwingman.wingman.WingmanEntry();
+                    WingmanRegistry.put(uid, entry);
+                }
+                entry.order                 = order;
+                entry.orderTimer            = 0;
+                entry.orbitAngle            = 0.0;
+                entry.strikePassesRemaining = order.strikePasses;
+                entry.reconMobCount         = 0;
+                entry.rtbReason             = "";
+                entry.autoState             = com.mcheliwingman.mission.AutonomousState.NONE;
+                entry.weaponType            = pickPrimaryWeapon(order);
+
+                player.sendMessage(new TextComponentString(
+                    "§aOrder dispatched: §e" + args[4]
+                    + "§a to " + shortId(wingman)
+                    + " §7(base=" + order.baseId + " target=" + (int)order.targetX + "," + (int)order.targetZ + ")"));
+                break;
+            }
+
+            case "abort": {
+                if (args.length >= 3) {
+                    UUID uid = parseUUID(player, args[2]);
+                    if (uid == null) return;
+                    com.mcheliwingman.wingman.WingmanEntry entry = WingmanRegistry.get(uid);
+                    if (entry != null) {
+                        entry.order     = null;
+                        entry.autoState = com.mcheliwingman.mission.AutonomousState.NONE;
+                    }
+                    player.sendMessage(new TextComponentString("§aOrder aborted for " + args[2].substring(0, 8)));
+                } else {
+                    int count = 0;
+                    for (com.mcheliwingman.wingman.WingmanEntry e : WingmanRegistry.snapshot().values()) {
+                        if (e.hasOrder()) { e.order = null; e.autoState = com.mcheliwingman.mission.AutonomousState.NONE; count++; }
+                    }
+                    player.sendMessage(new TextComponentString("§aAborted " + count + " order(s)."));
+                }
+                break;
+            }
+
+            case "status": {
+                boolean any = false;
+                for (Map.Entry<UUID, com.mcheliwingman.wingman.WingmanEntry> e : WingmanRegistry.snapshot().entrySet()) {
+                    com.mcheliwingman.wingman.WingmanEntry entry = e.getValue();
+                    if (!entry.hasOrder()) continue;
+                    any = true;
+                    com.mcheliwingman.mission.MissionOrder o = entry.order;
+                    player.sendMessage(new TextComponentString(
+                        "§7[" + e.getKey().toString().substring(0, 8) + "] "
+                        + "§fstate=" + entry.autoState
+                        + " §7types=" + o.missionTypes
+                        + " timer=" + entry.orderTimer / 20 + "s"
+                        + " rtb=" + (entry.rtbReason.isEmpty() ? "-" : entry.rtbReason)));
+                }
+                if (!any) player.sendMessage(new TextComponentString("§7No active MissionOrders."));
+                break;
+            }
+
+            case "park": {
+                // /wingman order park <uuid> <parkingId>
+                if (args.length < 4) {
+                    player.sendMessage(new TextComponentString("§7Usage: /wingman order park <uuid> <parkingId>"));
+                    return;
+                }
+                UUID uid = parseUUID(player, args[2]);
+                if (uid == null) return;
+                com.mcheliwingman.wingman.WingmanEntry entry = WingmanRegistry.get(uid);
+                if (entry == null) {
+                    entry = new com.mcheliwingman.wingman.WingmanEntry();
+                    WingmanRegistry.put(uid, entry);
+                }
+                entry.assignedParkingId = args[3];
+                entry.autoState = com.mcheliwingman.mission.AutonomousState.PARKED;
+                player.sendMessage(new TextComponentString(
+                    "§aParking assigned: §e" + args[3] + "§a for " + args[2].substring(0, 8)));
+                break;
+            }
+
+            default:
+                player.sendMessage(new TextComponentString(
+                    "§7Usage: /wingman order <dispatch|abort|status|park>"));
+        }
+    }
+
+    /** GUN以外の最初の武器を主攻撃武器として返す。 */
+    private String pickPrimaryWeapon(com.mcheliwingman.mission.MissionOrder order) {
+        for (String w : order.weapons) {
+            if (!"gun".equals(w)) return w;
+        }
+        return null;
+    }
+
+    // =========================================================================
     // gui  — open Mission Planner GUI on the client
     // =========================================================================
 
@@ -787,7 +939,7 @@ public class WingmanCommand extends CommandBase {
         if (args.length == 1) return getListOfStringsMatchingLastWord(args,
                 "follow", "stop", "status", "dist", "maxwings", "engage", "auto", "hold",
                 "weapon", "minalt", "maxalt", "alt", "spawnuav",
-                "marker", "route", "mission", "gui");
+                "marker", "route", "mission", "order", "gui");
         if (args.length == 2 && args[0].equalsIgnoreCase("alt"))
             return getListOfStringsMatchingLastWord(args, "clear");
         if (args.length == 2 && args[0].equalsIgnoreCase("weapon"))
@@ -804,6 +956,8 @@ public class WingmanCommand extends CommandBase {
             return getListOfStringsMatchingLastWord(args, "create", "list", "delete", "show");
         if (args.length == 2 && args[0].equalsIgnoreCase("mission"))
             return getListOfStringsMatchingLastWord(args, "assign", "abort", "status");
+        if (args.length == 2 && args[0].equalsIgnoreCase("order"))
+            return getListOfStringsMatchingLastWord(args, "dispatch", "abort", "status", "park");
         return Collections.emptyList();
     }
 }
