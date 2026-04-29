@@ -1,5 +1,6 @@
 package com.mcheliwingman.registry;
 
+import com.mcheliwingman.McHeliWingman;
 import com.mcheliwingman.mission.TaxiRoute;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.nbt.NBTTagList;
@@ -33,6 +34,8 @@ public class TaxiRouteRegistry extends WorldSavedData {
         TaxiRouteRegistry reg = get(world);
         reg.routes.put(route.routeId, route);
         reg.markDirty();
+        McHeliWingman.logger.info("[TaxiRoute] SAVE routeId={} baseId={} parkingId={} runwayId={} runwayBId={} wps={} heading={}",
+            route.routeId, route.baseId, route.parkingId, route.runwayId, route.runwayBId, route.waypointIds, route.parkingHeading);
     }
 
     public static void delete(World world, String routeId) {
@@ -43,10 +46,16 @@ public class TaxiRouteRegistry extends WorldSavedData {
 
     /** 指定基地のタキシールート一覧 */
     public static List<TaxiRoute> getForBase(World world, String baseId) {
+        TaxiRouteRegistry reg = get(world);
+        McHeliWingman.logger.info("[TaxiRoute] getForBase baseId={} totalRoutes={}", baseId, reg.routes.size());
+        for (TaxiRoute r : reg.routes.values()) {
+            McHeliWingman.logger.info("[TaxiRoute]   stored: routeId={} baseId={}", r.routeId, r.baseId);
+        }
         List<TaxiRoute> result = new ArrayList<>();
-        for (TaxiRoute r : get(world).routes.values()) {
+        for (TaxiRoute r : reg.routes.values()) {
             if (baseId.equals(r.baseId)) result.add(r);
         }
+        McHeliWingman.logger.info("[TaxiRoute] getForBase result={} routes", result.size());
         return result;
     }
 
@@ -54,6 +63,17 @@ public class TaxiRouteRegistry extends WorldSavedData {
     public static TaxiRoute findByParking(World world, String parkingId) {
         for (TaxiRoute r : get(world).routes.values()) {
             if (parkingId.equals(r.parkingId)) return r;
+        }
+        return null;
+    }
+
+    /**
+     * 滑走路端 / ヘリパッド ID からルートを検索。
+     * VTOL 着陸後の TAXI_IN 用: ヘリパッドID (= route.runwayId) でルートを逆引きする。
+     */
+    public static TaxiRoute findByRunway(World world, String runwayId) {
+        for (TaxiRoute r : get(world).routes.values()) {
+            if (runwayId.equals(r.runwayId)) return r;
         }
         return null;
     }
@@ -79,9 +99,18 @@ public class TaxiRouteRegistry extends WorldSavedData {
             List<String> wps = new ArrayList<>();
             NBTTagList wpList = c.getTagList("waypoints", Constants.NBT.TAG_STRING);
             for (int j = 0; j < wpList.tagCount(); j++) wps.add(wpList.getStringTagAt(j));
+            String runwayBId     = c.hasKey("runwayBId") ? c.getString("runwayBId") : "";
+            int    parkingHeading = c.hasKey("parkingHeading") ? c.getInteger("parkingHeading") : -1;
+            List<String> arrWps = new ArrayList<>();
+            if (c.hasKey("arrivalWaypoints")) {
+                NBTTagList arrList = c.getTagList("arrivalWaypoints", Constants.NBT.TAG_STRING);
+                for (int j = 0; j < arrList.tagCount(); j++) arrWps.add(arrList.getStringTagAt(j));
+            }
+            String arrivalRunwayId = c.hasKey("arrivalRunwayId") ? c.getString("arrivalRunwayId") : "";
             TaxiRoute r = new TaxiRoute(
                 c.getString("routeId"), c.getString("baseId"),
-                c.getString("parkingId"), c.getString("runwayId"), wps);
+                c.getString("parkingId"), c.getString("runwayId"), runwayBId, wps,
+                arrWps, parkingHeading, arrivalRunwayId);
             routes.put(r.routeId, r);
         }
     }
@@ -95,9 +124,15 @@ public class TaxiRouteRegistry extends WorldSavedData {
             c.setString("baseId",    r.baseId);
             c.setString("parkingId", r.parkingId);
             c.setString("runwayId",  r.runwayId);
+            c.setString("runwayBId", r.runwayBId);
+            c.setInteger("parkingHeading", r.parkingHeading);
             NBTTagList wpList = new NBTTagList();
             for (String wp : r.waypointIds) wpList.appendTag(new NBTTagString(wp));
             c.setTag("waypoints", wpList);
+            NBTTagList arrList = new NBTTagList();
+            for (String wp : r.arrivalWaypointIds) arrList.appendTag(new NBTTagString(wp));
+            c.setTag("arrivalWaypoints", arrList);
+            if (!r.arrivalRunwayId.isEmpty()) c.setString("arrivalRunwayId", r.arrivalRunwayId);
             list.appendTag(c);
         }
         tag.setTag("routes", list);

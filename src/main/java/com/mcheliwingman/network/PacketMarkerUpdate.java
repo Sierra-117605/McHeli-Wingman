@@ -23,16 +23,18 @@ public class PacketMarkerUpdate implements IMessage {
     public String typeName;
     public String id;
     public String baseId;
+    public int    parkingHeading = -1;
 
     public PacketMarkerUpdate() {}
 
-    public PacketMarkerUpdate(BlockPos pos, MarkerType type, String id, String baseId) {
-        this.x        = pos.getX();
-        this.y        = pos.getY();
-        this.z        = pos.getZ();
-        this.typeName = type.name();
-        this.id       = id;
-        this.baseId   = baseId;
+    public PacketMarkerUpdate(BlockPos pos, MarkerType type, String id, String baseId, int parkingHeading) {
+        this.x              = pos.getX();
+        this.y              = pos.getY();
+        this.z              = pos.getZ();
+        this.typeName       = type.name();
+        this.id             = id;
+        this.baseId         = baseId;
+        this.parkingHeading = parkingHeading;
     }
 
     @Override
@@ -41,14 +43,16 @@ public class PacketMarkerUpdate implements IMessage {
         writeStr(buf, typeName);
         writeStr(buf, id);
         writeStr(buf, baseId);
+        buf.writeInt(parkingHeading);
     }
 
     @Override
     public void fromBytes(ByteBuf buf) {
         x = buf.readInt(); y = buf.readInt(); z = buf.readInt();
-        typeName = readStr(buf);
-        id       = readStr(buf);
-        baseId   = readStr(buf);
+        typeName       = readStr(buf);
+        id             = readStr(buf);
+        baseId         = readStr(buf);
+        parkingHeading = buf.isReadable(4) ? buf.readInt() : -1;
     }
 
     public static class Handler implements IMessageHandler<PacketMarkerUpdate, IMessage> {
@@ -69,6 +73,7 @@ public class PacketMarkerUpdate implements IMessage {
                 wte.setMarkerType(type);
                 wte.setMarkerId(msg.id);
                 wte.setBaseId(type == MarkerType.BASE ? "" : msg.baseId);
+                wte.setParkingHeading(type == MarkerType.PARKING ? msg.parkingHeading : -1);
 
                 // レジストリ更新
                 MarkerRegistry.register(ws, pos, wte);

@@ -19,8 +19,8 @@ public class MissionOrder {
     public double targetX = 0;
     public double targetZ = 0;
 
-    /** 任務時間制限（分、0=無制限） */
-    public int timeLimitMinutes = 60;
+    /** 任務時間制限（秒、0=無制限）。デフォルト600秒（10分）。 */
+    public int timeLimitSeconds = 600;
 
     /** 出発・帰投基地ID */
     public String baseId = "";
@@ -37,11 +37,32 @@ public class MissionOrder {
     /** フェリー目的地基地ID（FERRY専用） */
     public String ferryDestBase = "";
 
+    /**
+     * 軌道旋回しながら側方射撃するモード（AC-130 等）。
+     * true の場合、武器種が gun/rocket など機首固定でも軌道を維持したまま射撃する。
+     * false（デフォルト）はスタンドオフアプローチ（通常の攻撃パス）。
+     */
+    public boolean orbitAttack = false;
+
+    /**
+     * VSTOL 離陸モード。
+     * true  : TAKEOFF_ROLL 中にノズルを 45° に固定し、VTOL 機が短距離離陸できるようにする。
+     * false : 通常の CTOL 離陸（ノズル 0°）。VTOL 機も通常の固定翼として離陸する。
+     */
+    public boolean useVstol = false;
+
+    /**
+     * 着陸専用タキシールート ID（オプション）。
+     * 設定されている場合、finishLanding() で出発ルートの逆順ではなくこのルートを使用する。
+     * 空文字列の場合は通常のフォールバック検索（departureRouteId の逆順など）を使用。
+     */
+    public String arrivalRouteId = "";
+
     public MissionOrder() {}
 
-    /** 時間制限（tick換算） */
+    /** 時間制限（tick換算）。timeLimitSeconds * 20 ticks。 */
     public int timeLimitTicks() {
-        return timeLimitMinutes * 60 * 20;
+        return timeLimitSeconds * 20;
     }
 
     public boolean hasType(MissionType type) {

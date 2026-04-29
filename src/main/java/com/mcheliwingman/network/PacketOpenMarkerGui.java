@@ -21,16 +21,18 @@ public class PacketOpenMarkerGui implements IMessage {
     private String typeName;
     private String id;
     private String baseId;
+    private int    parkingHeading = -1;
 
     public PacketOpenMarkerGui() {}
 
-    public PacketOpenMarkerGui(BlockPos pos, MarkerType type, String id, String baseId) {
-        this.x        = pos.getX();
-        this.y        = pos.getY();
-        this.z        = pos.getZ();
-        this.typeName = type.name();
-        this.id       = id;
-        this.baseId   = baseId;
+    public PacketOpenMarkerGui(BlockPos pos, MarkerType type, String id, String baseId, int parkingHeading) {
+        this.x              = pos.getX();
+        this.y              = pos.getY();
+        this.z              = pos.getZ();
+        this.typeName       = type.name();
+        this.id             = id;
+        this.baseId         = baseId;
+        this.parkingHeading = parkingHeading;
     }
 
     // ─── エンコード ───────────────────────────────────────────────────────────
@@ -43,6 +45,7 @@ public class PacketOpenMarkerGui implements IMessage {
         writeString(buf, typeName);
         writeString(buf, id);
         writeString(buf, baseId);
+        buf.writeInt(parkingHeading);
     }
 
     @Override
@@ -50,9 +53,10 @@ public class PacketOpenMarkerGui implements IMessage {
         x        = buf.readInt();
         y        = buf.readInt();
         z        = buf.readInt();
-        typeName = readString(buf);
-        id       = readString(buf);
-        baseId   = readString(buf);
+        typeName       = readString(buf);
+        id             = readString(buf);
+        baseId         = readString(buf);
+        parkingHeading = buf.isReadable(4) ? buf.readInt() : -1;
     }
 
     private static void writeString(ByteBuf buf, String s) {
@@ -82,7 +86,7 @@ public class PacketOpenMarkerGui implements IMessage {
                     type = MarkerType.PARKING;
                 }
                 BlockPos pos = new BlockPos(msg.x, msg.y, msg.z);
-                mc.displayGuiScreen(new GuiMarkerConfig(pos, type, msg.id, msg.baseId));
+                mc.displayGuiScreen(new GuiMarkerConfig(pos, type, msg.id, msg.baseId, msg.parkingHeading));
             });
             return null;
         }

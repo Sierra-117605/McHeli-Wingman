@@ -717,7 +717,7 @@ public class WingmanCommand extends CommandBase {
                 if (args.length > 7)  try { order.orbitRadius     = Double.parseDouble(args[7]); } catch (Exception ignored) {}
                 if (args.length > 8)  try { order.cruiseAlt        = Double.parseDouble(args[8]); } catch (Exception ignored) {}
                 if (args.length > 9)  try { order.strikePasses     = Integer.parseInt(args[9]);   } catch (Exception ignored) {}
-                if (args.length > 10) try { order.timeLimitMinutes = Integer.parseInt(args[10]);  } catch (Exception ignored) {}
+                if (args.length > 10) try { order.timeLimitSeconds = Integer.parseInt(args[10]);  } catch (Exception ignored) {}
 
                 // デフォルト武器をミッション種別から設定
                 for (com.mcheliwingman.mission.MissionType mt : order.missionTypes) {

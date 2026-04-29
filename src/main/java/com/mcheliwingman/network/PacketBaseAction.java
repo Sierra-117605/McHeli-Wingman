@@ -5,6 +5,7 @@ import com.mcheliwingman.mission.MissionOrder;
 import com.mcheliwingman.mission.MissionType;
 import com.mcheliwingman.mission.TaxiRoute;
 import com.mcheliwingman.registry.TaxiRouteRegistry;
+import com.mcheliwingman.util.McheliReflect;
 import com.mcheliwingman.wingman.WingmanEntry;
 import com.mcheliwingman.wingman.WingmanRegistry;
 import io.netty.buffer.ByteBuf;
@@ -33,16 +34,25 @@ public class PacketBaseAction implements IMessage {
     public int action;
 
     // SAVE_ROUTE / DELETE_ROUTE 共通
-    public String routeId = "", baseId = "", parkingId = "", runwayId = "";
+    public String routeId = "", baseId = "", parkingId = "", runwayId = "", runwayBId = "";
     public String waypointsCsv = "";
+    /** 着陸時専用WP（CSV）。空の場合は waypointsCsv の逆順を使用。 */
+    public String arrivalWaypointsCsv = "";
+    /** 着陸エントリー端点 ID。空の場合は runwayId を使用。 */
+    public String arrivalRunwayId = "";
+    /** 駐機方位: -1=任意, 0=N, 1=E, 2=S, 3=W */
+    public int parkingHeading = -1;
 
     // DISPATCH_ORDER
     public String wingmanUuid = "";
     public String missionTypesCsv = "";
     public String weaponsCsv = "";
     public double targetX = 0, targetZ = 0, orbitRadius = 300, cruiseAlt = 80;
-    public int    strikePasses = 2, timeLimitMinutes = 60;
+    public int    strikePasses = 2, timeLimitSeconds = 600;
     public String ferryDestBase = "";
+    public boolean orbitAttack = false;
+    public boolean useVstol    = false;
+    public String arrivalRouteId = "";
 
     public PacketBaseAction() {}
 
@@ -52,28 +62,40 @@ public class PacketBaseAction implements IMessage {
     public void toBytes(ByteBuf buf) {
         buf.writeInt(action);
         writeStr(buf, routeId);   writeStr(buf, baseId);
-        writeStr(buf, parkingId); writeStr(buf, runwayId);
+        writeStr(buf, parkingId); writeStr(buf, runwayId); writeStr(buf, runwayBId);
         writeStr(buf, waypointsCsv);
+        buf.writeInt(parkingHeading);
+        writeStr(buf, arrivalWaypointsCsv);
+        writeStr(buf, arrivalRunwayId);
         writeStr(buf, wingmanUuid);
         writeStr(buf, missionTypesCsv); writeStr(buf, weaponsCsv);
         buf.writeDouble(targetX);    buf.writeDouble(targetZ);
         buf.writeDouble(orbitRadius); buf.writeDouble(cruiseAlt);
-        buf.writeInt(strikePasses);   buf.writeInt(timeLimitMinutes);
+        buf.writeInt(strikePasses);   buf.writeInt(timeLimitSeconds);
         writeStr(buf, ferryDestBase);
+        buf.writeBoolean(orbitAttack);
+        buf.writeBoolean(useVstol);
+        writeStr(buf, arrivalRouteId);
     }
 
     @Override
     public void fromBytes(ByteBuf buf) {
         action    = buf.readInt();
         routeId   = readStr(buf); baseId     = readStr(buf);
-        parkingId = readStr(buf); runwayId   = readStr(buf);
+        parkingId = readStr(buf); runwayId   = readStr(buf); runwayBId = readStr(buf);
         waypointsCsv = readStr(buf);
+        parkingHeading = buf.isReadable() ? buf.readInt() : -1;
+        arrivalWaypointsCsv = buf.isReadable() ? readStr(buf) : "";
+        arrivalRunwayId     = buf.isReadable() ? readStr(buf) : "";
         wingmanUuid     = readStr(buf);
         missionTypesCsv = readStr(buf); weaponsCsv = readStr(buf);
         targetX = buf.readDouble();    targetZ    = buf.readDouble();
         orbitRadius = buf.readDouble(); cruiseAlt = buf.readDouble();
-        strikePasses = buf.readInt();  timeLimitMinutes = buf.readInt();
+        strikePasses = buf.readInt();  timeLimitSeconds = buf.readInt();
         ferryDestBase = readStr(buf);
+        orbitAttack     = buf.isReadable() && buf.readBoolean();
+        useVstol        = buf.isReadable() && buf.readBoolean();
+        arrivalRouteId  = buf.isReadable() ? readStr(buf) : "";
     }
 
     // ─── Handler (SERVER) ────────────────────────────────────────────────────
@@ -111,8 +133,16 @@ public class PacketBaseAction implements IMessage {
                     if (!t.isEmpty()) wps.add(t);
                 }
             }
+            List<String> arrWps = new ArrayList<>();
+            if (!msg.arrivalWaypointsCsv.isEmpty()) {
+                for (String s : msg.arrivalWaypointsCsv.split(",")) {
+                    String t = s.trim();
+                    if (!t.isEmpty()) arrWps.add(t);
+                }
+            }
             TaxiRoute route = new TaxiRoute(
-                msg.routeId, msg.baseId, msg.parkingId, msg.runwayId, wps);
+                msg.routeId, msg.baseId, msg.parkingId, msg.runwayId, msg.runwayBId, wps,
+                arrWps, msg.parkingHeading, msg.arrivalRunwayId);
             TaxiRouteRegistry.save(ws, route);
             player.sendMessage(new TextComponentString("§aRoute §e" + msg.routeId + "§a saved."));
         }
@@ -147,8 +177,11 @@ public class PacketBaseAction implements IMessage {
             order.orbitRadius       = msg.orbitRadius;
             order.cruiseAlt         = msg.cruiseAlt;
             order.strikePasses      = msg.strikePasses;
-            order.timeLimitMinutes  = msg.timeLimitMinutes;
+            order.timeLimitSeconds  = msg.timeLimitSeconds;
             order.ferryDestBase     = msg.ferryDestBase;
+            order.orbitAttack       = msg.orbitAttack;
+            order.useVstol          = msg.useVstol;
+            order.arrivalRouteId    = msg.arrivalRouteId;
 
             for (String s : msg.missionTypesCsv.split(",")) {
                 try { order.missionTypes.add(MissionType.valueOf(s.trim().toUpperCase())); }
@@ -164,6 +197,9 @@ public class PacketBaseAction implements IMessage {
                 return;
             }
 
+            // 燃料を満タンにしてから発令（spawned 直後で currentFuel=0 の場合の即 RTB を防ぐ）
+            McheliReflect.fillFuel(wingman);
+
             WingmanEntry entry = WingmanRegistry.get(uid);
             if (entry == null) {
                 entry = new WingmanEntry();
@@ -175,7 +211,35 @@ public class PacketBaseAction implements IMessage {
             entry.strikePassesRemaining  = order.strikePasses;
             entry.reconMobCount          = 0;
             entry.rtbReason              = "";
+            entry.attackMode             = WingmanEntry.ATK_NONE; // 再発令時に攻撃モードが残るのを防ぐ
+            entry.diagTick               = 0;
             entry.autoState              = AutonomousState.NONE; // tickOrder() が初期化
+            // VTOL ノズルを格納モードにリセット。
+            // 以前の VTOL_TAKEOFF ミッションや手動 VTOL 操作でノズルが展開されたまま残っていると、
+            // スロットル全開時に垂直推力が発生して滑走なしに即離陸してしまう。
+            // vtolOnSent=true により、次の WTH tick で forceVtolOff() が呼ばれノズルが格納される。
+            // VTOL ヘリパッドルートの場合は initOrder() が vtolHoverMode=true に上書きする。
+            entry.vtolHoverMode = false;
+            entry.vtolOnSent    = true;
+
+            // タキシールートを routeId → parkingId で解決。なければ空中発進。
+            if (!msg.routeId.isEmpty()) {
+                TaxiRoute route = TaxiRouteRegistry.findById(ws, msg.routeId);
+                if (route != null) {
+                    entry.assignedParkingId = route.parkingId;
+                    entry.departureRouteId  = msg.routeId;  // findById で確実にルートを取得するため
+                    player.sendMessage(new TextComponentString(
+                        "§aTaxi route §e" + route.routeId + "§a → parking §e" + route.parkingId));
+                } else {
+                    player.sendMessage(new TextComponentString(
+                        "§cRoute not found: " + msg.routeId + " — airborne start"));
+                    entry.assignedParkingId = "";
+                    entry.departureRouteId  = "";
+                }
+            } else {
+                entry.assignedParkingId = ""; // 空中発進
+                entry.departureRouteId  = "";
+            }
             // 主攻撃武器を WingmanTickHandler 用に設定（GUN 以外の最初の武器）
             entry.weaponType = pickPrimaryWeapon(order);
 

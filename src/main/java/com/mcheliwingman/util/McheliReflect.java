@@ -16,7 +16,9 @@ import java.util.Map;
 public class McheliReflect {
 
     // Cache for resolved fields to avoid repeated lookups
-    private static final Map<String, Field> fieldCache = new HashMap<>();
+    private static final Map<String, Field>  fieldCache   = new HashMap<>();
+    /** 存在しないと確定したフィールドのキーセット（毎tick WARN が出るのを防ぐ）。 */
+    private static final java.util.Set<String> notFoundKeys = new java.util.HashSet<>();
 
     private static final String CLASS_AIRCRAFT = "mcheli.aircraft.MCH_EntityAircraft";
 
@@ -58,23 +60,26 @@ public class McheliReflect {
 
     /**
      * Gets a field from the class or any superclass, with caching.
+     * Fields confirmed missing are recorded in notFoundKeys to suppress repeat WARNs.
      */
     public static Field getField(Class<?> cls, String name) {
         String key = cls.getName() + "#" + name;
-        return fieldCache.computeIfAbsent(key, k -> {
-            Class<?> c = cls;
-            while (c != null) {
-                try {
-                    Field f = c.getDeclaredField(name);
-                    f.setAccessible(true);
-                    return f;
-                } catch (NoSuchFieldException e) {
-                    c = c.getSuperclass();
-                }
+        if (notFoundKeys.contains(key)) return null;
+        if (fieldCache.containsKey(key)) return fieldCache.get(key);
+        Class<?> c = cls;
+        while (c != null) {
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                fieldCache.put(key, f);
+                return f;
+            } catch (NoSuchFieldException e) {
+                c = c.getSuperclass();
             }
-            McHeliWingman.logger.warn("Field not found: {}", key);
-            return null;
-        });
+        }
+        McHeliWingman.logger.warn("Field not found: {} (suppressing further warnings)", key);
+        notFoundKeys.add(key);
+        return null;
     }
 
     /**
@@ -138,6 +143,23 @@ public class McheliReflect {
             McHeliWingman.logger.warn("getRiddenByEntity() call failed: {}", e.getMessage());
             return null;
         }
+    }
+
+    // ─── スロットル ──────────────────────────────────────────────────────────
+
+    /** 現在のスロットル値 (0.0〜1.0) を返す（取得失敗時は -1）。 */
+    public static double getCurrentThrottle(Entity aircraft) {
+        if (!isAircraft(aircraft)) return -1;
+        try {
+            java.lang.reflect.Method m = aircraft.getClass().getMethod("getCurrentThrottle");
+            Object v = m.invoke(aircraft);
+            if (v instanceof Number) return ((Number) v).doubleValue();
+        } catch (Exception ignored) {}
+        for (String name : new String[]{"currentThrottle", "throttle", "throttleLevel"}) {
+            Object v = getFieldValue(aircraft, name);
+            if (v instanceof Number) return ((Number) v).doubleValue();
+        }
+        return -1;
     }
 
     // ─── 燃料 ────────────────────────────────────────────────────────────────
@@ -242,6 +264,46 @@ public class McheliReflect {
     }
 
     /**
+     * 機体の燃料を満タンにする。
+     * currentFuel / fuel / fuelAmount フィールドに maxFuel 値を書き込む。
+     * 無限燃料設定の場合は何もしない。
+     * float フィールドと double フィールドの両方に対応する。
+     */
+    public static void fillFuel(Entity aircraft) {
+        if (!isAircraft(aircraft)) return;
+        if (hasInfiniteFuel(aircraft)) return;
+        double max = getMaxFuel(aircraft);
+        if (max <= 0) return;
+        for (String name : new String[]{"currentFuel", "fuel", "fuelAmount"}) {
+            // まず現在値を読んでフィールドの存在・型を確認する
+            Object current = getFieldValue(aircraft, name);
+            if (!(current instanceof Number)) continue;
+            Field f = getField(aircraft.getClass(), name);
+            if (f == null) continue;
+            try {
+                Class<?> type = f.getType();
+                if (type == float.class || type == Float.class) {
+                    f.setFloat(aircraft, (float) max);
+                } else if (type == int.class || type == Integer.class) {
+                    f.setInt(aircraft, (int) max);
+                } else if (type == long.class || type == Long.class) {
+                    f.setLong(aircraft, (long) max);
+                } else {
+                    f.setDouble(aircraft, max);
+                }
+                McHeliWingman.logger.info("fillFuel: {} {} -> {} (type={}, ac={})",
+                    name, ((Number) current).doubleValue(), max,
+                    type.getSimpleName(), aircraft.getClass().getSimpleName());
+                return;
+            } catch (IllegalAccessException | IllegalArgumentException e) {
+                McHeliWingman.logger.warn("fillFuel: cannot write {}: {}", name, e.getMessage());
+            }
+        }
+        McHeliWingman.logger.warn("fillFuel: no writable fuel field found on {}",
+            aircraft.getClass().getSimpleName());
+    }
+
+    /**
      * Sets the value of a field on an object.
      * Returns true on success.
      */
@@ -255,6 +317,94 @@ public class McheliReflect {
         } catch (IllegalAccessException e) {
             McHeliWingman.logger.warn("Cannot write field {}: {}", fieldName, e.getMessage());
             return false;
+        }
+    }
+
+    // ─── 機種判定 ─────────────────────────────────────────────────────────────
+
+    /**
+     * 機体がヘリコプターかどうかを返す。
+     * McHeli CE の getKindName() 戻り値が "heli"/"helicopter"/"rotor"/"chopper" を含む場合にヘリ判定。
+     * （MCH_EntityHeli の getKindName() は "helicopter" を返す可能性があるため contains で判定）
+     */
+    public static boolean isHelicopter(Entity aircraft) {
+        if (!isAircraft(aircraft)) return false;
+        try {
+            java.lang.reflect.Method m = aircraft.getClass().getMethod("getKindName");
+            Object result = m.invoke(aircraft);
+            if (result instanceof String) {
+                String kind = ((String) result).toLowerCase();
+                return kind.contains("heli") || kind.contains("rotor") || kind.contains("chopper");
+            }
+        } catch (Exception e) {
+            McHeliWingman.logger.debug("getKindName() failed on {}: {}", aircraft, e.getMessage());
+        }
+        // フォールバック: クラス名に "heli" が含まれるか
+        return aircraft.getClass().getName().toLowerCase().contains("heli");
+    }
+
+    /**
+     * 機体が VTOL 能力を持つかどうかを返す（ヘリコプター除く固定翼機判定）。
+     * McHeli CE の基底クラス MCH_EntityAircraft が getVtolMode() を public 定義しているため、
+     * getter の存在だけで判定すると全固定翼機が VTOL 扱いになってしまう。
+     * → getter (getVtolMode) と VTOL 制御メソッド (swithVtolMode / switchVtolMode) の
+     *   両方が存在する場合のみ真の VTOL 機と判定する。
+     */
+    public static boolean isVtol(Entity aircraft) {
+        if (!isAircraft(aircraft)) return false;
+        if (isHelicopter(aircraft)) return false;  // ヘリコプターは VTOL 扱いしない
+        // getter がなければ確実に非 VTOL
+        try {
+            aircraft.getClass().getMethod("getVtolMode");
+        } catch (NoSuchMethodException e) {
+            return false;
+        } catch (Exception e) {
+            McHeliWingman.logger.debug("isVtol getter check failed on {}: {}", aircraft, e.getMessage());
+            return false;
+        }
+        // VTOL 制御メソッド (swithVtolMode / switchVtolMode) の存在も確認。
+        // 基底クラス由来の getter のみを持つ非 VTOL 機を除外するため。
+        for (String name : new String[]{"swithVtolMode", "switchVtolMode"}) {
+            try { aircraft.getClass().getMethod(name, boolean.class); return true; }
+            catch (NoSuchMethodException ignored) {}
+            try { aircraft.getClass().getMethod(name); return true; }
+            catch (NoSuchMethodException ignored) {}
+        }
+        return false;
+    }
+
+    /**
+     * 機体がヘリパッドを使用できるか（ヘリコプターまたは VTOL 機）。
+     */
+    public static boolean canUseHelipad(Entity aircraft) {
+        return isHelicopter(aircraft) || isVtol(aircraft);
+    }
+
+    // ─── VSTOL ノズル制御 ─────────────────────────────────────────────────────
+
+    /**
+     * VTOL ノズルの回転角度を強制設定する。
+     *   0°  = 固定翼モード（前進推力のみ）
+     *   45° = VSTOL モード（前進推力 + 揚力の合成）
+     *   90° = VTOL モード（垂直推力のみ）
+     *
+     * McHeli は毎 tick ノズルを目標角へ自動回転させるが、Phase.END で毎 tick 上書きすることで
+     * 任意の固定角に保持できる。VSTOL 離陸中（TAKEOFF_ROLL）に 45° を維持し、
+     * TAKEOFF_ROLL を抜けた後は上書きをやめて McHeli に 0° へ戻させる。
+     *
+     * McHeli CE の MCH_EntityPlane#partNozzle (MCH_Parts) の rotation フィールドを操作する。
+     * partNozzle が存在しない機種（ヘリ・通常固定翼）では何もしない。
+     */
+    public static void setNozzleRotation(Entity aircraft, float degrees) {
+        if (!isAircraft(aircraft)) return;
+        Object partNozzle = getFieldValue(aircraft, "partNozzle");
+        if (partNozzle == null) return;  // VTOL ノズルを持たない機種はスキップ
+        Field rotField = getField(partNozzle.getClass(), "rotation");
+        if (rotField == null) return;
+        try {
+            rotField.setFloat(partNozzle, degrees);
+        } catch (Exception e) {
+            McHeliWingman.logger.debug("[VSTOL] setNozzleRotation({}) failed: {}", degrees, e.getMessage());
         }
     }
 }

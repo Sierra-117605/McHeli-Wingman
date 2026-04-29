@@ -2,6 +2,8 @@ package com.mcheliwingman.handler;
 
 import com.mcheliwingman.McHeliWingman;
 import com.mcheliwingman.util.McheliReflect;
+import com.mcheliwingman.wingman.WingmanEntry;
+import com.mcheliwingman.wingman.WingmanRegistry;
 import net.minecraft.entity.Entity;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.World;
@@ -123,6 +125,31 @@ public class ChunkLoadHandler implements ForgeChunkManager.LoadingCallback {
                     desired.size(), entity.getClass().getSimpleName(), cx, cz);
         }
 
+        // ─── 自律飛行中の機体: loadedEntityList に存在しなくても最終位置のチャンクを維持 ──────
+        // McHeli の物理更新でエンティティが未ロードチャンクへ移動すると、loadedEntityList から
+        // 消えても entitiesByUuid には残る。チケットを解放すると強制ロードが解除されてチャンクが
+        // アンロードされ、その後 WTH/AFH が getEntityFromUuid() で取得できなくなる。
+        // → WingmanEntry に active なオーダーがある間はチケットを保持し、
+        //   lastPos（最終既知チャンク）周囲を強制ロードし続ける。
+        for (Map.Entry<UUID, WingmanEntry> we : WingmanRegistry.snapshot().entrySet()) {
+            if (!we.getValue().isAutonomous()) continue;
+            UUID uid = we.getKey();
+            if (alive.contains(uid)) continue; // loadedEntityList にあるので通常処理で OK
+            ChunkPos lastKnown = lastPos.get(uid);
+            Ticket ticket = tickets.get(uid);
+            if (lastKnown == null || ticket == null) continue;
+            // 最終既知位置の 5×5 を強制ロード維持
+            for (int dx = -CHUNK_RADIUS; dx <= CHUNK_RADIUS; dx++) {
+                for (int dz = -CHUNK_RADIUS; dz <= CHUNK_RADIUS; dz++) {
+                    ChunkPos cp = new ChunkPos(lastKnown.x + dx, lastKnown.z + dz);
+                    ImmutableSetSnapshot forced = new ImmutableSetSnapshot(ticket.getChunkList());
+                    if (!forced.contains(cp)) ForgeChunkManager.forceChunk(ticket, cp);
+                }
+            }
+            McHeliWingman.logger.debug("[ChunkLoad] {} not in loadedEntityList but has active order — keeping chunk forced at ({},{})",
+                    uid, lastKnown.x, lastKnown.z);
+        }
+
         // Release tickets for entities in THIS dimension that are no longer present.
         // We must guard by dimension ID: other worlds (nether, end) also fire
         // WorldTickEvent, and their 'alive' sets would otherwise incorrectly
@@ -134,6 +161,9 @@ public class ChunkLoadHandler implements ForgeChunkManager.LoadingCallback {
             UUID uid = entry.getKey();
             if (ticketDim.getOrDefault(uid, Integer.MIN_VALUE) != currentDim) continue;
             if (!alive.contains(uid)) {
+                // アクティブなオーダーがある機体はチケットを解放しない（上記ブロックで維持済み）
+                WingmanEntry we = WingmanRegistry.get(uid);
+                if (we != null && we.isAutonomous()) continue;
                 ForgeChunkManager.releaseTicket(entry.getValue());
                 lastPos.remove(uid);
                 ticketDim.remove(uid);

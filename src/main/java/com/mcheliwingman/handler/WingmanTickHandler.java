@@ -38,24 +38,26 @@ public class WingmanTickHandler {
     // 親機停止判定速度（ブロック/tick）
     private static final double LEADER_STOP_SPEED = 0.4;
     // 自動攻撃索敵レンジ
-    private static final double AUTO_ATTACK_RANGE = 200.0;
+    // NOTE: orbit半径のデフォルト300ブロックをカバーするため400に設定。
+    //       旋回軌道(半径300)上から目標中心のゾンビ距離 ≈ 300 > 200 で届かなかった問題を修正。
+    private static final double AUTO_ATTACK_RANGE = 400.0;
     // 発射後の逃避時間（tick）— この間は現在ヨーを維持してエスケープ
     private static final int POST_FIRE_ESCAPE_TICKS = 40;
 
     // 武器種別スタンドオフ距離（接敵目標水平距離）— 近づき過ぎない
     private static double standoffForWeapon(String type) {
-        if (type == null) return 120.0;
+        if (type == null) return 80.0;
         switch (type.toLowerCase()) {
             case "gun": case "machinegun": case "machinegun1": case "machinegun2":
-            case "cannon":                return 80.0;
-            case "cas":                   return 100.0;
-            case "rocket": case "mkrocket": return 150.0;
+            case "cannon":                return 50.0;   // 近距離で精密掃射
+            case "cas":                   return 60.0;
+            case "rocket": case "mkrocket": return 80.0; // 120→80: より近くから発射
             case "missile": case "aamissile": case "atmissile": case "tvmissile":
-                                          return 250.0;
-            case "asmissile":             return 300.0;
-            case "bomb":                  return 200.0;   // 爆弾は特に離す
+                                          return 200.0;
+            case "asmissile":             return 280.0;
+            case "bomb":                  return 180.0;
             case "torpedo":               return 40.0;
-            default:                      return 120.0;
+            default:                      return 80.0;
         }
     }
 
@@ -138,6 +140,10 @@ public class WingmanTickHandler {
     private Field    lastRiderYawField, lastRiderPitchField;
     private boolean  controlResolved = false;
 
+    // McHeli 独自乗員取得: getPassengers() が空の場合に getRiddenByEntity() で取得する
+    private Method   getRiddenByEntityMethod;
+    private boolean  riderMethodResolved = false;
+
     // getRotYaw/getRotPitch（現在の機体角度取得用）
     private Method   getRotYawMethod, getRotPitchMethod;
 
@@ -146,6 +152,7 @@ public class WingmanTickHandler {
 
     // VTOL制御（固定翼機）
     private Method   getVtolModeMethod, swithVtolModeMethod;
+    private boolean  swithVtolModeHasArg = false;  // true: boolean引数, false: no-argトグル
     private boolean  vtolResolved = false;
 
     // Weapons
@@ -176,9 +183,35 @@ public class WingmanTickHandler {
             if (wingman == null || wingman.isDead) continue;
             WingmanEntry entry = e.getValue();
 
-            // 固定翼: VTOLモードを強制OFF
-            if (!isHelicopter(wingman)) {
-                forceVtolOff(wingman);
+            // VTOL/固定翼: 状態に応じてVTOLモードを制御
+            // ヘリコプター以外かつ VTOL 機能を持つ機体のみ処理する
+            if (!isHelicopter(wingman) && com.mcheliwingman.util.McheliReflect.isVtol(wingman)) {
+                // vtolNozzleMode を毎tick更新 (0=格納完了, 1=ノズル回転中, 2=90°展開完了)
+                // McHeli の getVtolMode():int を読み取り WingmanEntry に反映 → AFH が参照してスロットルを制御
+                resolveVtolMethods(wingman);
+                if (getVtolModeMethod != null) {
+                    try {
+                        Object raw = getVtolModeMethod.invoke(wingman);
+                        entry.vtolNozzleMode = (raw instanceof Number) ? ((Number) raw).intValue() : 0;
+                    } catch (Exception ignored) {}
+                }
+
+                boolean needsVtol = entry.isAutonomous() && entry.vtolHoverMode;
+
+                // VTOL ON/OFF 制御: vtolOnSent フラグで 1 サイクルに 1 回だけ送信する。
+                // ─── 問題: swithVtolMode が no-arg トグルの場合、毎 tick 呼ぶと
+                //   ON → OFF → ON → OFF ... と交互してノズルが完成しない。
+                //   また getVtolMode() がノズル回転中も 0 を返す実装では
+                //   vtolNozzleMode==0 条件が毎 tick 成立してしまう。
+                // ─── 解決: vtolHoverMode が変わったときのみ 1 回だけコマンドを送る。
+                //   vtolOnSent は AFH が vtolHoverMode を変更するたびに false にリセットする。
+                if (needsVtol && !entry.vtolOnSent) {
+                    forceVtolOn(wingman);
+                    entry.vtolOnSent = true;
+                } else if (!needsVtol && entry.vtolOnSent) {
+                    forceVtolOff(wingman);
+                    entry.vtolOnSent = false;
+                }
             }
 
             if (entry.attackMode != WingmanEntry.ATK_NONE) {
@@ -186,13 +219,118 @@ public class WingmanTickHandler {
                 maintainEngine(wingman, 1.0);
                 steerToTarget(ws, wingman, entry);
             } else if (entry.isAutonomous()) {
-                // 自律飛行中: AutonomousFlightHandlerが設定した目標へ全力追従
-                double dx = entry.autoTargetX - wingman.posX;
-                double dy = entry.autoTargetY - wingman.posY;
-                double dz = entry.autoTargetZ - wingman.posZ;
-                double distToTarget = Math.sqrt(dx * dx + dy * dy + dz * dz);
-                maintainEngine(wingman, distToTarget > 20 ? 1.0 : 0.5);
-                steerToTarget(ws, wingman, entry);
+                // ─── 搭乗プレイヤーの rotationYaw を目標方向に上書き ─────────────
+                // McHeli の onUpdate_Server は毎 tick の冒頭で
+                //   aircraft.lastRiderYaw = rider.rotationYaw
+                // を実行し、その値で機体の向き（レンダリング含む）を決定する。
+                // McHeli は IEntitySinglePassenger 独自実装のため getPassengers() が空。
+                // → getMcheliRider() で getRiddenByEntity() を使い乗員を取得する。
+                // → Phase.START（ネットワーク後・エンティティ更新前）で rider.rotationYaw を
+                //   目標方向に上書きすることで、onUpdate_Server が正しい方向を読む。
+                Entity mcheliRider = getMcheliRider(wingman);
+                if (mcheliRider instanceof net.minecraft.entity.player.EntityPlayer) {
+                    // ヨー修正: 目標方向が 1ブロック以上離れている場合のみ計算。
+                    // スロットル修正: 常に毎tick送信（距離条件に依存しない）。
+                    double pdx = entry.autoTargetX - wingman.posX;
+                    double pdz = entry.autoTargetZ - wingman.posZ;
+                    float pTargetYaw = Float.NaN; // NaN = クライアント側のヨー補間をリセット
+                    if (pdx * pdx + pdz * pdz >= 1.0) {
+                        pTargetYaw = (float) Math.toDegrees(Math.atan2(-pdx, pdz));
+                        // サーバー側: rider.rotationYaw を上書き（lastRiderYaw 経由で物理方向を修正）
+                        mcheliRider.rotationYaw = pTargetYaw;
+                    }
+                    // クライアント側ビジュアル修正: PacketAutopilotVisual でヨー角・スロットルを毎tick送信。
+                    // McHeli の onUpdateAircraft() がキー入力 (throttleUp/Down=false) からスロットルを
+                    // 再計算して上書きするため、ClientAutopilotHandler が Phase.END で打ち消す必要がある。
+                    if (mcheliRider instanceof net.minecraft.entity.player.EntityPlayerMP) {
+                        float curThrottle = (float) com.mcheliwingman.util.McheliReflect.getCurrentThrottle(wingman);
+                        com.mcheliwingman.network.WingmanNetwork.sendToPlayer(
+                            new com.mcheliwingman.network.PacketAutopilotVisual(
+                                wingman.getEntityId(), pTargetYaw, curThrottle),
+                            (net.minecraft.entity.player.EntityPlayerMP) mcheliRider);
+                    }
+                }
+
+                if (entry.autoState == AutonomousState.ALIGN) {
+                    // ALIGN: スロットル0 + motion0 で停止保持。
+                    // steerToTarget でヨーをレート制限付きで滑走路方向へ回転させる。
+                    // isTaxiingState には含めない（即時 setRotYaw でALIGN条件が早期成立するため）。
+                    maintainEngine(wingman, 0.0);
+                    wingman.motionX = 0;
+                    wingman.motionY = 0;
+                    wingman.motionZ = 0;
+                    steerToTarget(ws, wingman, entry);
+                    // 地上停止中はピッチ・ロールを水平に保つ（前ステートの残留姿勢を防ぐ）
+                    resolveRotationMethods(wingman);
+                    setRotPitch(wingman, 0.0f);
+                    setRotRoll(wingman,  0.0f);
+                } else if (isTaxiingState(entry.autoState)) {
+                    // タキシング中: スロットル0。
+                    // McHeli物理更新前の位置を記録し、motion を進行方向にセットする。
+                    // → McHeli が motion を適用してホイールアニメーションを動かす。
+                    // → Phase.END の taxiPushPosition() が記録した参照位置から正確な位置に補正
+                    //    する（McHeli 分 + taxiPushPosition 分の二重加算を防ぐ）。
+                    maintainEngine(wingman, 0.0);
+                    entry.taxiPreX = wingman.posX;
+                    entry.taxiPreZ = wingman.posZ;
+                    double tdx = entry.autoTargetX - wingman.posX;
+                    double tdz = entry.autoTargetZ - wingman.posZ;
+                    double tDist = Math.sqrt(tdx * tdx + tdz * tdz);
+                    resolveRotationMethods(wingman);
+                    if (tDist > 0.5) {
+                        wingman.motionX = (tdx / tDist) * TAXI_SPEED;
+                        wingman.motionZ = (tdz / tDist) * TAXI_SPEED;
+                        // McHeli物理更新前に機首を進行方向へ向ける
+                        float tYaw = (float) Math.toDegrees(Math.atan2(-tdx, tdz));
+                        setRotYaw(wingman, tYaw);
+                    } else {
+                        wingman.motionX = 0;
+                        wingman.motionZ = 0;
+                    }
+                    wingman.motionY = 0; // 垂直移動を抑制（浮上・沈降防止）
+                    // 地上走行中はピッチ・ロールを水平に保つ（前ステートの残留姿勢を防ぐ）
+                    setRotPitch(wingman, 0.0f);
+                    setRotRoll(wingman,  0.0f);
+                } else if (isAfhThrottleState(entry.autoState)) {
+                    // 着陸サーキット・離陸ロールなど: AFHがスロットルを精密制御するステート。
+                    steerToTarget(ws, wingman, entry);
+                    // TAKEOFF_ROLL / CLIMB: 常に全力スロットル。
+                    // AFH の setThrottle は内部フィールドのみ更新し DataParameter を更新しない。
+                    // McHeli の地上物理は DataParameter を読むため、WTH の maintainEngine
+                    //（setCurrentThrottle + DataParameter の両方を設定）で補完する必要がある。
+                    // ALIGN で DataParameter が 0 にセットされたまま TAKEOFF_ROLL に遷移すると
+                    // 推力が発生しないため、ここで確実に 1.0 を書き込む。
+                    if (entry.autoState == AutonomousState.TAKEOFF_ROLL
+                            || entry.autoState == AutonomousState.CLIMB) {
+                        maintainEngine(wingman, 1.0);
+                    }
+                    // VTOLホバー中（離陸上昇・垂直降下）はピッチを0°に固定する。
+                    // steerToTarget が 3D ターゲット角度でピッチをつけると、
+                    // VTOL ホバーモードではそのピッチが前後水平移動に変換されてしまう。
+                    // pitch=0 にすることでスロットル（垂直推力）のみで真上に昇降させる。
+                    if (entry.vtolHoverMode) {
+                        resolveRotationMethods(wingman);
+                        setRotPitch(wingman, 0.0f);
+                    }
+                } else if (entry.autoState == AutonomousState.NONE
+                           || entry.autoState == AutonomousState.PARKED) {
+                    // NONE : AFH が同 tick の Phase.START(後半)で initOrder() を実行して状態確定。
+                    //        WTH が先に動くため、初期化前に高スロットル・旋回を適用するとテレポートが発生する。
+                    // PARKED: 駐機中は停止保持。
+                    // → スロットル 0・motion 0 で停止。旋回なし。
+                    maintainEngine(wingman, 0.0);
+                    wingman.motionX = 0;
+                    wingman.motionY = 0;
+                    wingman.motionZ = 0;
+                } else {
+                    // 巡航・RtB・オンステーションなど: 目標距離に応じてスロットル調整
+                    double dx = entry.autoTargetX - wingman.posX;
+                    double dy = entry.autoTargetY - wingman.posY;
+                    double dz = entry.autoTargetZ - wingman.posZ;
+                    double distToTarget = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    maintainEngine(wingman, distToTarget > 20 ? 1.0 : 0.5);
+                    steerToTarget(ws, wingman, entry);
+                }
             } else if (entry.leader != null) {
                 // フォーメーション追従: 指定スロットまでの距離に応じてスロットル調整
                 double[] fp = formationPos(entry.leader, entry.formationSlot);
@@ -236,10 +374,9 @@ public class WingmanTickHandler {
 
         boolean heli = isHelicopter(wingman);
         boolean inAttack = (entry.attackMode != WingmanEntry.ATK_NONE);
-        // 攻撃中は旋回レートを高めてスピード感ある機動に
-        float maxYawRate = inAttack
-            ? (heli ? 6.0f : 3.0f)
-            : (heli ? MAX_YAW_RATE_HELI : MAX_YAW_RATE_PLANE);
+        // 攻撃中は旋回・ピッチレートを高めて精密追跡。固定翼は 5°/tick で目標追跡できる。
+        float maxYawRate   = inAttack ? (heli ? 8.0f : 5.0f) : (heli ? MAX_YAW_RATE_HELI : MAX_YAW_RATE_PLANE);
+        float maxPitchRate = inAttack ? 5.0f : MAX_PITCH_RATE;
 
         // 現在の機体角度を取得
         float currentYaw   = getCurrentRotYaw(wingman);
@@ -249,32 +386,35 @@ public class WingmanTickHandler {
             double dx = aimRef[0] - wingman.posX;
             double dz = aimRef[2] - wingman.posZ;
             double dy = aimRef[1] - wingman.posY;
+            // XZ距離を先に計算してヨー不定ゾーンを検出する
+            double hDist = Math.sqrt(dx * dx + dz * dz);
 
-            // ─── Yaw: 常にターゲット方向へ機体を向ける ───────────────────
-            float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+            // ─── Yaw: XZ距離が1ブロック以上ある場合のみ更新 ──────────────
+            // hDist < 1.0 の場合（VTOL垂直上昇・降下中など）はヨーを変えない。
+            // そうしないと atan2(-dx, dz) が不定になりスピンが発生する。
+            float lastYawStep = 0f; // バンク計算用にヨーステップを外部から参照できるよう保持
+            if (hDist >= 1.0) {
+                float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
 
-            // フォーメーション追従中: スロットに近いほどリーダーのヨーに追随する。
-            // スロットが旋回で動くたびに向き直すジグザグを防ぎ、
-            // リーダーのロールとほぼ同調した自然な旋回を実現する。
-            if (!inAttack && !entry.isAutonomous() && entry.leader != null) {
-                double hDistToSlot = Math.sqrt(dx * dx + dz * dz);
-                // alpha: 0(スロット密着)→1(30ブロック以上離れている)
-                float alpha = (float) Math.min(1.0, hDistToSlot / 30.0);
-                float leaderYaw = entry.leader.rotationYaw;
-                float diff = targetYaw - leaderYaw;
-                while (diff >  180f) diff -= 360f;
-                while (diff < -180f) diff += 360f;
-                // 近い: リーダーのヨー基準に微補正 / 遠い: スロット方向へ全力
-                targetYaw = leaderYaw + diff * alpha;
+                // フォーメーション追従中: スロットに近いほどリーダーのヨーに追随する。
+                if (!inAttack && !entry.isAutonomous() && entry.leader != null) {
+                    // alpha: 0(スロット密着)→1(30ブロック以上離れている)
+                    float alpha = (float) Math.min(1.0, hDist / 30.0);
+                    float leaderYaw = entry.leader.rotationYaw;
+                    float diff = targetYaw - leaderYaw;
+                    while (diff >  180f) diff -= 360f;
+                    while (diff < -180f) diff += 360f;
+                    targetYaw = leaderYaw + diff * alpha;
+                }
+
+                float yawDiff = targetYaw - currentYaw;
+                while (yawDiff >  180f) yawDiff -= 360f;
+                while (yawDiff < -180f) yawDiff += 360f;
+                lastYawStep = Math.max(-maxYawRate, Math.min(maxYawRate, yawDiff));
+                setRotYaw(wingman, currentYaw + lastYawStep);
+                try { if (lastRiderYawField != null) lastRiderYawField.setFloat(wingman, targetYaw); }
+                catch (Exception ignored) {}
             }
-
-            float yawDiff = targetYaw - currentYaw;
-            while (yawDiff >  180f) yawDiff -= 360f;
-            while (yawDiff < -180f) yawDiff += 360f;
-            float yawStep = Math.max(-maxYawRate, Math.min(maxYawRate, yawDiff));
-            setRotYaw(wingman, currentYaw + yawStep);
-            try { if (lastRiderYawField != null) lastRiderYawField.setFloat(wingman, targetYaw); }
-            catch (Exception ignored) {}
 
             // ─── Roll: フォーメーション追従中はリーダーのロール角に追随 ──
             if (!inAttack && !entry.isAutonomous() && entry.leader != null) {
@@ -287,8 +427,25 @@ public class WingmanTickHandler {
                 setRotRoll(wingman, currentRoll + rollStep);
             }
 
+            // ─── Roll: 自律固定翼のバンク（旋回に連動）───────────────────
+            // ヨーレートに比例したバンク角を設定（右旋回→内側バンク）。
+            // McHeli の rotationYaw は左旋回で増加するため、lastYawStep が正 = 左旋回。
+            // 左旋回で内側（左）にバンクさせるには正のロール値が必要。
+            // ∴ targetRoll = +lastYawStep（符号反転なし）
+            // ヘリ・VTOLホバー・TAKEOFF_ROLL・ALIGN 中はバンクなし（地上または垂直動作）。
+            if (entry.isAutonomous() && !heli && !entry.vtolHoverMode
+                    && entry.autoState != AutonomousState.TAKEOFF_ROLL
+                    && entry.autoState != AutonomousState.ALIGN) {
+                float targetRoll = lastYawStep * 7.0f;
+                targetRoll = Math.max(-45f, Math.min(45f, targetRoll));
+                float curRoll = getCurrentRotRoll(wingman);
+                float rDiff   = targetRoll - curRoll;
+                while (rDiff >  180f) rDiff -= 360f;
+                while (rDiff < -180f) rDiff += 360f;
+                setRotRoll(wingman, curRoll + Math.max(-MAX_ROLL_RATE, Math.min(MAX_ROLL_RATE, rDiff)));
+            }
+
             // ─── Pitch ───────────────────────────────────────────────────
-            double hDist = Math.sqrt(dx * dx + dz * dz);
             // 固定砲（gun/cannon/cas）: 機首ごとターゲットに向ける
             // それ以外の武器（missile/bomb等）: 機体は水平維持、lastRiderPitchでエイム
             boolean fixedGun = inAttack && isFixedGunWeapon(entry.weaponType);
@@ -300,7 +457,6 @@ public class WingmanTickHandler {
                 targetPitch = Math.max(MAX_PITCH_DOWN, Math.min(MAX_PITCH_UP, targetPitch));
             } else {
                 // 高度維持ピッチ（movTargetのY座標に向かう分だけ）
-                // aimTargetのdyではなくmovTargetのdyで計算して機体を水平に保つ
                 double movDy = (movTarget != null) ? (movTarget[1] - wingman.posY) : dy;
                 if (heli) {
                     targetPitch = (float) -Math.toDegrees(Math.atan2(movDy, Math.max(hDist, 0.1)));
@@ -310,7 +466,7 @@ public class WingmanTickHandler {
                     targetPitch = Math.max(MAX_PITCH_DOWN, Math.min(MAX_PITCH_UP, targetPitch));
                 }
             }
-            float pitchStep = Math.max(-MAX_PITCH_RATE, Math.min(MAX_PITCH_RATE, targetPitch - currentPitch));
+            float pitchStep = Math.max(-maxPitchRate, Math.min(maxPitchRate, targetPitch - currentPitch));
             setRotPitch(wingman, currentPitch + pitchStep);
 
             // lastRiderPitch: 攻撃中は武器エイム用に実際のターゲットへの角度を渡す
@@ -364,12 +520,17 @@ public class WingmanTickHandler {
         setRotYaw(wingman, currentYaw + repStep);
     }
 
-    /** 機首方向固定の直射武器（gun/cannon/cas）か判定。これ以外はフリールック可能とみなす。 */
+    /**
+     * 機首方向固定の直射武器か判定。
+     * gun/cannon/cas/rocket は砲身・ポッドが機体前方固定のため機首をターゲットに向ける必要がある。
+     * missile/bomb は誘導または垂直投下のため機体向き不問。
+     */
     private static boolean isFixedGunWeapon(String type) {
         if (type == null) return false;
         switch (type.toLowerCase()) {
             case "gun": case "machinegun": case "machinegun1": case "machinegun2":
             case "cannon": case "cas":
+            case "rocket": case "mkrocket":
                 return true;
             default:
                 return false;
@@ -401,15 +562,38 @@ public class WingmanTickHandler {
             if (entry.attackMode != WingmanEntry.ATK_NONE) {
                 Entity target = resolveTarget(ws, wingman, entry);
                 if (target != null && !target.isDead) {
+                    // 5秒に1回ターゲット情報をINFOログ（攻撃対象の特定用）
+                    if (entry.diagTick % 100 == 1) {
+                        McHeliWingman.logger.info(
+                            "[Wingman/ATK] {} targeting: name='{}' class={} pos=({},{},{}) dist={}",
+                            wingman.getUniqueID().toString().substring(0, 8),
+                            target.getName(), target.getClass().getSimpleName(),
+                            (int)target.posX, (int)target.posY, (int)target.posZ,
+                            (int)wingman.getDistance(target));
+                    }
                     double dx   = target.posX - wingman.posX;
                     double dy   = (target.posY + 1.5) - wingman.posY;
                     double dz   = target.posZ - wingman.posZ;
                     double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-                    float  yaw  = (float) Math.toDegrees(Math.atan2(-dx, dz));
                     float  hd   = (float) Math.sqrt(dx * dx + dz * dz);
-                    float  pitch = (float) -Math.toDegrees(Math.atan2(dy, hd));
+                    float  yaw  = (float) Math.toDegrees(Math.atan2(-dx, dz));
+                    float  pitch = (float) -Math.toDegrees(Math.atan2(dy, Math.max(hd, 1.0f)));
                     if (dist <= fireRangeForWeapon(entry.weaponType)) {
-                        tryFire(wingman, entry.leader, target, yaw, pitch, entry.weaponType);
+                        // 発射条件を武器種別で分岐:
+                        //   爆弾    : 水平距離≤80ブロックのみ投下（直上または進行方向直下）
+                        //   固定銃  : 機首誤差≤20°のみ発射（gun/cannon/rocket など）
+                        //   ミサイル: 方向不問（軌道旋回中の側方発射も含む）
+                        boolean canFire = true;
+                        if (isBombWeapon(entry.weaponType)) {
+                            canFire = hd <= 80.0f;
+                        } else if (isFixedGunWeapon(entry.weaponType)) {
+                            float yawErr = Math.abs(yaw - getCurrentRotYaw(wingman));
+                            if (yawErr > 180f) yawErr = 360f - yawErr;
+                            canFire = yawErr < 20.0f;
+                        }
+                        if (canFire) {
+                            tryFire(wingman, entry.leader, target, yaw, pitch, entry.weaponType);
+                        }
                     }
                 }
             }
@@ -435,6 +619,39 @@ public class WingmanTickHandler {
                 // 自律飛行中: autoState に応じてギアを自動制御
                 autoGear(wingman, entry.autoState);
             }
+
+            // タキシング中: McHeli物理更新後に地上位置を直接移動する
+            if (entry.isAutonomous() && isTaxiingState(entry.autoState)) {
+                taxiPushPosition(wingman, entry);
+            }
+
+            // 自律飛行中にプレイヤーが搭乗している場合の機首方向修正。
+            // ─ 根本修正: Phase.START で rider.rotationYaw を目標方向に上書き済み。
+            //   McHeli の onUpdate_Server が lastRiderYaw = rider.rotationYaw を読む前に
+            //   Phase.START が実行されるため、物理推力方向は正しくなっている。
+            // ─ Phase.END: setRotYaw でこの tick の視覚的な機首方向をさらに確定させる。
+            //   タキシング中は taxiPushPosition が対処済みなので除外。
+            if (entry.isAutonomous() && !isTaxiingState(entry.autoState)) {
+                Entity endRider = getMcheliRider(wingman);
+                if (endRider instanceof net.minecraft.entity.player.EntityPlayer) {
+                    double px = entry.autoTargetX - wingman.posX;
+                    double pz = entry.autoTargetZ - wingman.posZ;
+                    double phd = Math.sqrt(px * px + pz * pz);
+                    if (phd >= 1.0) {
+                        resolveRotationMethods(wingman);
+                        float targetYaw  = (float) Math.toDegrees(Math.atan2(-px, pz));
+                        float currentYaw = getCurrentRotYaw(wingman);
+                        float maxRate    = isHelicopter(wingman) ? MAX_YAW_RATE_HELI : MAX_YAW_RATE_PLANE;
+                        float yawDiff    = targetYaw - currentYaw;
+                        while (yawDiff >  180f) yawDiff -= 360f;
+                        while (yawDiff < -180f) yawDiff += 360f;
+                        setRotYaw(wingman, currentYaw + Math.max(-maxRate, Math.min(maxRate, yawDiff)));
+                        // rider.rotationYaw も再上書き: McHeli updatePassenger が lastRiderYaw を
+                        // rider に push するが、次 tick の Phase.START でまた上書きするため保険として。
+                        endRider.rotationYaw = targetYaw;
+                    }
+                }
+            }
         }
     }
 
@@ -445,45 +662,49 @@ public class WingmanTickHandler {
         if (entry.attackMode != WingmanEntry.ATK_NONE) {
             Entity target = resolveTarget(ws, wingman, entry);
             if (target != null && !target.isDead) {
-                double standoff  = standoffForWeapon(entry.weaponType);
-                double altOffset = altOffsetForWeapon(entry.weaponType);
-                double dx    = target.posX - wingman.posX;
-                double dz    = target.posZ - wingman.posZ;
-                double hDist = Math.sqrt(dx * dx + dz * dz);
-                double idealTY = target.posY + altOffset;
-                // 攻撃高度フロア/シーリング（/wingman minalt・maxalt で設定、0=無効）
-                if (WingmanConfig.minAttackAltitude > 0)
-                    idealTY = Math.max(idealTY, WingmanConfig.minAttackAltitude);
-                if (WingmanConfig.maxAttackAltitude > 0)
-                    idealTY = Math.min(idealTY, WingmanConfig.maxAttackAltitude);
-
-                double[] raw;
-                if (hDist > standoff) {
-                    // スタンドオフ距離まで接近
-                    double ratio = (hDist - standoff) / hDist;
-                    raw = new double[]{
-                        wingman.posX + dx * ratio,
-                        idealTY,
-                        wingman.posZ + dz * ratio
-                    };
+                boolean orbitFlag = (entry.order != null && entry.order.orbitAttack);
+                if (isOrbitFireWeapon(entry.weaponType, orbitFlag)) {
+                    return computeOrbitTarget(wingman, target, entry);
+                } else if (isBombWeapon(entry.weaponType)) {
+                    return computeOverflyTarget(wingman, target, entry);
                 } else {
-                    // スタンドオフ圏内: ターゲットから離れる方向に逃げる
-                    double norm = Math.max(hDist, 0.1);
-                    raw = new double[]{
-                        target.posX + (-dx / norm) * standoff * 1.5,
-                        idealTY,
-                        target.posZ + (-dz / norm) * standoff * 1.5
-                    };
+                    return computeApproachTarget(wingman, target, entry);
                 }
-
-                // リーダーとの最小クリアランス（Side/Rear の小さい方を半径とする）
-                raw = applyLeaderClearance(raw, entry.leader);
-                return raw;
             }
         }
         // 自律飛行中: AutonomousFlightHandlerが設定した目標座標を使う
         if (entry.isAutonomous()) {
-            return new double[]{ entry.autoTargetX, entry.autoTargetY, entry.autoTargetZ };
+            double[] raw = new double[]{ entry.autoTargetX, entry.autoTargetY, entry.autoTargetZ };
+
+            // ─── 旋回中の推力逆転防止（バンクターン誘導）────────────────────────
+            // 地上 / 着陸サーキット / ALIGN 中は適用しない（位置精度優先）。
+            // それ以外の巡航状態で目標が現在機首方向から 60° 以上ずれている場合、
+            // 目標ではなく「現在機首方向から最大 60° 先」の誘導点へ向かわせる。
+            // これにより: 推力ベクトルが速度ベクトルと大きくずれず、旋回中も前進を維持できる。
+            if (!isTaxiingState(entry.autoState)
+                    && !isAfhThrottleState(entry.autoState)
+                    && entry.autoState != AutonomousState.ALIGN
+                    && !entry.vtolHoverMode) {
+                double tdx = raw[0] - wingman.posX;
+                double tdz = raw[2] - wingman.posZ;
+                double rawDist = Math.sqrt(tdx * tdx + tdz * tdz);
+                if (rawDist > 20) {
+                    float curYaw = wingman.rotationYaw; // 反射不要（バニラフィールド）
+                    float toTargetYaw = (float) Math.toDegrees(Math.atan2(-tdx, tdz));
+                    float yawDiff = toTargetYaw - curYaw;
+                    while (yawDiff >  180f) yawDiff -= 360f;
+                    while (yawDiff < -180f) yawDiff += 360f;
+                    // 60° を超えるヨー差: 「60° 先」の誘導点にクランプ
+                    if (Math.abs(yawDiff) > 60f) {
+                        float leadYaw = curYaw + Math.signum(yawDiff) * 60f;
+                        double rad = Math.toRadians(leadYaw);
+                        double leadX = wingman.posX + (-Math.sin(rad)) * 40.0;
+                        double leadZ = wingman.posZ + Math.cos(rad) * 40.0;
+                        return new double[]{ leadX, raw[1], leadZ };
+                    }
+                }
+            }
+            return raw;
         }
         if (entry.state == WingmanState.FOLLOWING && entry.leader != null) {
             return formationPos(entry.leader, entry.formationSlot);
@@ -520,6 +741,116 @@ public class WingmanTickHandler {
         Entity target = resolveTarget(ws, wingman, entry);
         if (target == null || target.isDead) return null;
         return new double[]{target.posX, target.posY + 1.5, target.posZ};
+    }
+
+    // ─── Attack path helpers ─────────────────────────────────────────────────
+
+    /**
+     * 軌道旋回しながら攻撃（ミサイル / orbitAttack=true の AC-130 モード）。
+     * 機体はターゲット周囲を一定半径で旋回し、射程内に入るたびに武器を発射する。
+     * ヨーはターゲット方向ではなく旋回軌道の接線方向になるため、
+     * 側方射撃（AC-130）や誘導ミサイルの全周発射に対応できる。
+     */
+    private double[] computeOrbitTarget(Entity wingman, Entity target, WingmanEntry entry) {
+        // 軌道半径: ミッションオーダーの orbitRadius を優先、なければ武器スタンドオフ距離
+        double orbitRadius = (entry.order != null && entry.order.orbitRadius > 0)
+                ? entry.order.orbitRadius
+                : standoffForWeapon(entry.weaponType);
+        double altOffset = altOffsetForWeapon(entry.weaponType);
+        double idealTY   = target.posY + altOffset;
+        if (WingmanConfig.minAttackAltitude > 0) idealTY = Math.max(idealTY, WingmanConfig.minAttackAltitude);
+        if (WingmanConfig.maxAttackAltitude > 0) idealTY = Math.min(idealTY, WingmanConfig.maxAttackAltitude);
+
+        // 旋回角を毎tick進める（2°/tick ≒ 180tick で一周）
+        entry.orbitAngle = (entry.orbitAngle + 2.0) % 360.0;
+        double rad = Math.toRadians(entry.orbitAngle);
+        double[] raw = new double[]{
+            target.posX + Math.sin(rad) * orbitRadius,
+            idealTY,
+            target.posZ + Math.cos(rad) * orbitRadius
+        };
+        return applyLeaderClearance(raw, entry.leader);
+    }
+
+    /**
+     * スタンドオフ接近攻撃（gun / rocket）。
+     * スタンドオフ距離まで直線接近し、超えたら後退する往復アプローチ。
+     * 機首固定武器はこのモードで機首をターゲットに向けながら接近して発射する。
+     */
+    private double[] computeApproachTarget(Entity wingman, Entity target, WingmanEntry entry) {
+        double standoff  = standoffForWeapon(entry.weaponType);
+        double altOffset = altOffsetForWeapon(entry.weaponType);
+        double dx    = target.posX - wingman.posX;
+        double dz    = target.posZ - wingman.posZ;
+        double hDist = Math.sqrt(dx * dx + dz * dz);
+        double idealTY = target.posY + altOffset;
+        if (WingmanConfig.minAttackAltitude > 0) idealTY = Math.max(idealTY, WingmanConfig.minAttackAltitude);
+        if (WingmanConfig.maxAttackAltitude > 0) idealTY = Math.min(idealTY, WingmanConfig.maxAttackAltitude);
+
+        double[] raw;
+        if (hDist > standoff) {
+            double ratio = (hDist - standoff) / hDist;
+            raw = new double[]{
+                wingman.posX + dx * ratio,
+                idealTY,
+                wingman.posZ + dz * ratio
+            };
+        } else {
+            // スタンドオフ圏内: ターゲットから離れる方向に逃げる
+            double norm = Math.max(hDist, 0.1);
+            raw = new double[]{
+                target.posX + (-dx / norm) * standoff * 1.5,
+                idealTY,
+                target.posZ + (-dz / norm) * standoff * 1.5
+            };
+        }
+        return applyLeaderClearance(raw, entry.leader);
+    }
+
+    /**
+     * 直上通過投下（bomb）。
+     * ターゲットを機首方向に見て、その80ブロック先を目標にする。
+     * これにより機体はターゲット直上を通過する軌道を飛び、通過時に爆弾を投下する。
+     * 投下条件（水平距離≤80）は Phase.END の発射チェックで別途管理する。
+     */
+    private double[] computeOverflyTarget(Entity wingman, Entity target, WingmanEntry entry) {
+        double altOffset = altOffsetForWeapon("bomb"); // 200m
+        double idealTY   = target.posY + altOffset;
+        if (WingmanConfig.minAttackAltitude > 0) idealTY = Math.max(idealTY, WingmanConfig.minAttackAltitude);
+        if (WingmanConfig.maxAttackAltitude > 0) idealTY = Math.min(idealTY, WingmanConfig.maxAttackAltitude);
+
+        // 現在の進行方向にターゲットを80ブロック超えた点を目標に設定
+        float facingRad = (float) Math.toRadians(getCurrentRotYaw(wingman));
+        double fwdX = -Math.sin(facingRad);
+        double fwdZ =  Math.cos(facingRad);
+        double[] raw = new double[]{
+            target.posX + fwdX * 80.0,
+            idealTY,
+            target.posZ + fwdZ * 80.0
+        };
+        return applyLeaderClearance(raw, entry.leader);
+    }
+
+    /**
+     * 軌道旋回射撃を行う武器か判定する。
+     * ・orbitAttack フラグ（AC-130モード）が true なら全武器で旋回射撃。
+     * ・誘導ミサイル系は全周射撃可能なため常に旋回軌道を取る（接近せずに射程維持）。
+     */
+    private static boolean isOrbitFireWeapon(String type, boolean orbitAttack) {
+        if (orbitAttack) return true;
+        if (type == null) return false;
+        switch (type.toLowerCase()) {
+            case "missile": case "aamissile": case "atmissile":
+            case "tvmissile": case "asmissile":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** 爆弾系武器か判定（垂直投下のため直上通過アプローチが必要）。 */
+    private static boolean isBombWeapon(String type) {
+        return type != null && type.toLowerCase().equals("bomb");
     }
 
     /**
@@ -573,6 +904,37 @@ public class WingmanTickHandler {
         return null;
     }
 
+    // ─── 敵判定（IMob + McHeli ターゲットドローン）────────────────────────────
+
+    /** isEnemy ログ済みエンティティ UUID（ログ重複排除用）。 */
+    private static final java.util.Set<UUID> enemyLoggedSet = java.util.Collections.newSetFromMap(
+        new java.util.concurrent.ConcurrentHashMap<>());
+
+    /**
+     * 敵として扱うエンティティか判定する。
+     * ・IMob（Minecraft 敵対モブ）
+     * ・McHeli 機体で isUAV()=true（BQM-74E 等のターゲットドローン）かつ自軍でないもの
+     *
+     * 注: unmanned（乗客なし）フォールバックは Phalanx 等の地上設置型兵器を誤検出するため不使用。
+     *     isUAV() が BQM-74E で true を返すことを確認済み（MCP_EntityPlane）。
+     */
+    private static boolean isEnemy(Entity e) {
+        if (e instanceof IMob) return true;
+        // McHeli 航空機以外はスキップ
+        if (!com.mcheliwingman.util.McheliReflect.isAircraft(e)) return false;
+        // 自軍ウィングマンは攻撃しない
+        if (WingmanRegistry.snapshot().containsKey(e.getUniqueID())) return false;
+        // UAV（isUAV=true）のみ敵判定（BQM-74E 等のターゲットドローン）
+        boolean uav = com.mcheliwingman.util.McheliReflect.isUAV(e);
+        // McHeli 機体の検出をエンティティごとに1回だけログ（spam 防止）
+        if (enemyLoggedSet.add(e.getUniqueID())) {
+            McHeliWingman.logger.info(
+                "[Wingman/CAP] McHeli aircraft found: name='{}' class={} isUAV={} → enemy={}",
+                e.getName(), e.getClass().getSimpleName(), uav, uav);
+        }
+        return uav;
+    }
+
     private Entity findNearestHostile(Entity wingman, double range,
                                       java.util.Set<UUID> exclude, java.util.List<Entity> siblings) {
         double minSep = WingmanConfig.formationSideDist > 0
@@ -582,7 +944,7 @@ public class WingmanTickHandler {
         Entity best   = null;
         outer:
         for (Entity e : wingman.world.loadedEntityList) {
-            if (e == wingman || !(e instanceof IMob) || e.isDead) continue;
+            if (e == wingman || !isEnemy(e) || e.isDead) continue;
             if (exclude != null && exclude.contains(e.getUniqueID())) continue;
             // 攻撃経路（wingman→ターゲット間の中点）が他の子機に近すぎる場合はスキップ
             if (minSep > 0 && siblings != null) {
@@ -971,9 +1333,10 @@ public class WingmanTickHandler {
             case ON_STATION:
             case STRIKE_PASS:
             case RTB:
+            case VTOL_TAKEOFF:  // VTOL離陸中はギア格納
                 retract = true;
                 break;
-            default:  // TAXI_OUT, ALIGN, TAKEOFF_ROLL, CIRCUIT_FINAL, LANDING, TAXI_IN, PARKED など
+            default:  // TAXI_OUT, ALIGN, TAKEOFF_ROLL, CIRCUIT_FINAL, LANDING, TAXI_IN, PARKED, VTOL_LAND など
                 retract = false;
                 break;
         }
@@ -1013,28 +1376,177 @@ public class WingmanTickHandler {
         setRotYaw(aircraft, childYaw + yawStep);
     }
 
+    // ─── Taxi helpers ────────────────────────────────────────────────────────
+
+    /** 地上タキシング中のステートか判定する。
+     *  ALIGN は除外 — ALIGN は rate-limited steerToTarget でヨー回転させる別処理。*/
+    private static boolean isTaxiingState(AutonomousState state) {
+        return state == AutonomousState.TAXI_OUT
+            || state == AutonomousState.TAXI_IN
+            || state == AutonomousState.LANDING; // A端タッチダウン後のB端への地上ロール
+    }
+
+    /**
+     * AFH（AutonomousFlightHandler）がスロットルを精密制御するステートか判定する。
+     * WTH はこれらのステートでスロットルを上書きしない。
+     * 着陸サーキット全ステートと離陸ロール（TAKEOFF_ROLL）が該当。
+     */
+    private static boolean isAfhThrottleState(AutonomousState state) {
+        switch (state) {
+            case TAKEOFF_ROLL:
+            case CLIMB:
+            case DESCEND:
+            case CIRCUIT_DOWNWIND:
+            case CIRCUIT_BASE:
+            case CIRCUIT_FINAL:
+            case LANDING:
+            case VTOL_TAKEOFF:  // VTOL離着陸中: AFHがスロットルを精密制御
+            case VTOL_LAND:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** タキシング速度 (blocks/tick) ≒ 5 m/s */
+    private static final double TAXI_SPEED = 0.25;
+
+    /**
+     * McHeli 物理更新後（Phase.END）に機体を地上タキシング目標方向へ強制移動する。
+     * スロットルは 0 に保ち、setPosition() で位置を上書きして地上走行を表現する。
+     */
+    private void taxiPushPosition(Entity wingman, WingmanEntry entry) {
+        // Phase.START で記録した McHeli 物理更新前の XZ 位置を参照点として使う。
+        // McHeli が Phase.START で設定した motion を適用して機体を動かした後に
+        // この補正を掛けるため、二重加算にならず正確に TAXI_SPEED で前進できる。
+        double baseX = entry.taxiPreX;
+        double baseZ = entry.taxiPreZ;
+        double dx = entry.autoTargetX - baseX;
+        double dz = entry.autoTargetZ - baseZ;
+        double dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < 0.5) {
+            wingman.motionX = 0;
+            wingman.motionZ = 0;
+            return; // 目標到達済み
+        }
+
+        // LANDING 状態: タッチダウン速度から指数減衰で TAXI_SPEED まで減速する。
+        // それ以外: 固定 TAXI_SPEED。
+        double speed;
+        if (entry.autoState == com.mcheliwingman.mission.AutonomousState.LANDING
+                && entry.landingRollSpeed > TAXI_SPEED) {
+            entry.landingRollSpeed = Math.max(TAXI_SPEED, entry.landingRollSpeed * 0.965);
+            speed = entry.landingRollSpeed;
+        } else {
+            speed = TAXI_SPEED;
+        }
+
+        double step = Math.min(speed, dist);
+        double newX = baseX + (dx / dist) * step;
+        double newZ = baseZ + (dz / dist) * step;
+        // Y は McHeli 物理が確定した高さを維持（地面追従）
+        wingman.setPosition(newX, wingman.posY, newZ);
+
+        // 次 tick の Phase.START に備えて motion を維持（ホイールアニメーション継続）
+        wingman.motionX = (dx / dist) * speed;
+        wingman.motionZ = (dz / dist) * speed;
+
+        // ヨーを進行方向に向ける（Phase.END でも再確認）、ピッチ・ロールを水平に維持
+        float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        resolveRotationMethods(wingman);
+        setRotYaw(wingman,   targetYaw);
+        setRotPitch(wingman, 0.0f);
+        setRotRoll(wingman,  0.0f);
+
+        // 5秒毎にタキシー進捗ログ
+        if (entry.diagTick % 100 == 0) {
+            McHeliWingman.logger.info("[Taxi] {} push base=({},{}) pos=({},{}) target=({},{}) dist={} step={} yaw={}",
+                wingman.getUniqueID().toString().substring(0, 8),
+                String.format("%.1f", baseX), String.format("%.1f", baseZ),
+                String.format("%.1f", wingman.posX), String.format("%.1f", wingman.posZ),
+                String.format("%.1f", entry.autoTargetX), String.format("%.1f", entry.autoTargetZ),
+                String.format("%.1f", dist), String.format("%.3f", step),
+                String.format("%.1f", targetYaw));
+        }
+    }
+
     // ─── Aircraft type / VTOL ────────────────────────────────────────────────
 
     private boolean isHelicopter(Entity aircraft) {
         try {
-            return "heli".equalsIgnoreCase((String) aircraft.getClass().getMethod("getKindName").invoke(aircraft));
-        } catch (Exception e) { return true; }
+            Object result = aircraft.getClass().getMethod("getKindName").invoke(aircraft);
+            if (result instanceof String) {
+                String kind = ((String) result).toLowerCase();
+                return kind.contains("heli") || kind.contains("rotor") || kind.contains("chopper");
+            }
+        } catch (Exception e) { /* fall through */ }
+        return aircraft.getClass().getName().toLowerCase().contains("heli");
+    }
+
+    /**
+     * getVtolMode() の戻り値を型に依らず boolean に変換する。
+     * McHeli CE の実装によって boolean / int (0=OFF, 1=ON) / Integer どれでも来る可能性がある。
+     * (int) キャストを直接行うと boolean の場合 ClassCastException が catch に飲まれ、
+     * VTOL が一切切り替わらない（固定翼通常離陸になる）バグを防ぐ。
+     */
+    private boolean isVtolCurrentlyOn(Entity aircraft) throws Exception {
+        Object state = getVtolModeMethod.invoke(aircraft);
+        if (state instanceof Boolean) return (Boolean) state;
+        if (state instanceof Number)  return ((Number) state).intValue() != 0;
+        return false; // null やその他型は OFF 扱い
     }
 
     private void forceVtolOff(Entity aircraft) {
-        if (!vtolResolved) {
-            vtolResolved = true;
-            getVtolModeMethod   = findMethod(aircraft.getClass(), "getVtolMode");
-            swithVtolModeMethod = findMethod(aircraft.getClass(), "swithVtolMode", boolean.class);
-            McHeliWingman.logger.info("[Wingman] VTOL methods resolved: {}",
-                    getVtolModeMethod != null && swithVtolModeMethod != null);
-        }
+        resolveVtolMethods(aircraft);
         if (getVtolModeMethod == null || swithVtolModeMethod == null) return;
         try {
-            if ((int) getVtolModeMethod.invoke(aircraft) != 0) {
-                swithVtolModeMethod.invoke(aircraft, false);
+            if (isVtolCurrentlyOn(aircraft)) {
+                if (swithVtolModeHasArg) swithVtolModeMethod.invoke(aircraft, false);
+                else                     swithVtolModeMethod.invoke(aircraft);
+                McHeliWingman.logger.info("[VTOL] {} McHeli VTOL=OFF (fixed-wing mode)",
+                    aircraft.getUniqueID().toString().substring(0, 8));
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            McHeliWingman.logger.warn("[VTOL] forceVtolOff failed: {}", e.getMessage());
+        }
+    }
+
+    private void forceVtolOn(Entity aircraft) {
+        resolveVtolMethods(aircraft);
+        if (getVtolModeMethod == null || swithVtolModeMethod == null) return;
+        try {
+            if (!isVtolCurrentlyOn(aircraft)) {
+                if (swithVtolModeHasArg) swithVtolModeMethod.invoke(aircraft, true);
+                else                     swithVtolModeMethod.invoke(aircraft);
+                McHeliWingman.logger.info("[VTOL] {} McHeli VTOL=ON (hover mode)",
+                    aircraft.getUniqueID().toString().substring(0, 8));
+            }
+        } catch (Exception e) {
+            McHeliWingman.logger.warn("[VTOL] forceVtolOn failed: {}", e.getMessage());
+        }
+    }
+
+    private void resolveVtolMethods(Entity aircraft) {
+        if (vtolResolved) return;
+        vtolResolved = true;
+        getVtolModeMethod = findMethod(aircraft.getClass(), "getVtolMode");
+        // boolean引数版を先に試す → no-argトグル版 → 別名(switchVtolMode)も試みる
+        Method m = findMethod(aircraft.getClass(), "swithVtolMode", boolean.class);
+        if (m != null) { swithVtolModeMethod = m; swithVtolModeHasArg = true; }
+        else {
+            m = findMethod(aircraft.getClass(), "swithVtolMode");
+            if (m != null) { swithVtolModeMethod = m; swithVtolModeHasArg = false; }
+            else {
+                m = findMethod(aircraft.getClass(), "switchVtolMode", boolean.class);
+                if (m != null) { swithVtolModeMethod = m; swithVtolModeHasArg = true; }
+                else {
+                    m = findMethod(aircraft.getClass(), "switchVtolMode");
+                    if (m != null) { swithVtolModeMethod = m; swithVtolModeHasArg = false; }
+                }
+            }
+        }
+        McHeliWingman.logger.info("[Wingman] VTOL methods resolved: getVtolMode={} toggleVtol={} hasArg={}",
+                getVtolModeMethod != null, swithVtolModeMethod != null, swithVtolModeHasArg);
     }
 
     // ─── Reflection resolution ───────────────────────────────────────────────
@@ -1181,6 +1693,31 @@ public class WingmanTickHandler {
         while (cls != null) {
             try { Method m = cls.getDeclaredMethod(name, params); m.setAccessible(true); return m; }
             catch (NoSuchMethodException ignored) { cls = cls.getSuperclass(); }
+        }
+        return null;
+    }
+
+    /**
+     * McHeli の独自乗員取得。
+     * McHeli は IEntitySinglePassenger を実装し getRiddenByEntity() で乗員を返す。
+     * vanilla の getPassengers() は空のことが多いため、こちらを優先して使用する。
+     */
+    private Entity getMcheliRider(Entity aircraft) {
+        // 1) McHeli の getRiddenByEntity() を試みる
+        if (!riderMethodResolved) {
+            riderMethodResolved = true;
+            getRiddenByEntityMethod = findMethod(aircraft.getClass(), "getRiddenByEntity");
+            McHeliWingman.logger.info("[Wingman] getRiddenByEntity method resolved: {}", getRiddenByEntityMethod != null);
+        }
+        if (getRiddenByEntityMethod != null) {
+            try {
+                Object result = getRiddenByEntityMethod.invoke(aircraft);
+                if (result instanceof Entity) return (Entity) result;
+            } catch (Exception ignored) {}
+        }
+        // 2) vanilla の getPassengers() にフォールバック
+        for (Entity pass : aircraft.getPassengers()) {
+            return pass;
         }
         return null;
     }

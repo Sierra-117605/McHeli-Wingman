@@ -5,6 +5,9 @@ import com.mcheliwingman.network.PacketPlannerData;
 import com.mcheliwingman.network.PacketRouteAction;
 import com.mcheliwingman.network.PacketOpenBaseGui;
 import com.mcheliwingman.network.PacketBaseAction;
+import com.mcheliwingman.network.PacketWingmanPanelOpen;
+import com.mcheliwingman.network.PacketWingmanPanelData;
+import com.mcheliwingman.network.PacketWingmanPanelAction;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraftforge.fml.common.network.NetworkRegistry;
 import net.minecraftforge.fml.common.network.simpleimpl.IMessage;
@@ -25,6 +28,12 @@ public class WingmanNetwork {
         CHANNEL.registerMessage(PacketOpenMarkerGui.Handler.class,    PacketOpenMarkerGui.class,    nextId++, Side.CLIENT);
         CHANNEL.registerMessage(PacketOpenBaseGui.Handler.class,      PacketOpenBaseGui.class,      nextId++, Side.CLIENT);
         CHANNEL.registerMessage(PacketBaseAction.Handler.class,       PacketBaseAction.class,       nextId++, Side.SERVER);
+        // Wingman Panel
+        CHANNEL.registerMessage(PacketWingmanPanelOpen.Handler.class,  PacketWingmanPanelOpen.class,  nextId++, Side.SERVER);
+        CHANNEL.registerMessage(PacketWingmanPanelData.Handler.class,  PacketWingmanPanelData.class,  nextId++, Side.CLIENT);
+        CHANNEL.registerMessage(PacketWingmanPanelAction.Handler.class, PacketWingmanPanelAction.class, nextId++, Side.SERVER);
+        // 自律飛行 ビジュアルヘディング同期 (server→client)
+        CHANNEL.registerMessage(PacketAutopilotVisual.Handler.class, PacketAutopilotVisual.class, nextId++, Side.CLIENT);
     }
 
     public static void sendToPlayer(IMessage msg, EntityPlayerMP player) {

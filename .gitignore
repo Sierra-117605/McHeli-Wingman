@@ -28,4 +28,4 @@ libs/*.jar
 # McHeli decompiled sources and assets (dependency, not our code)
 mcheli/
 net/
-assets/
+/assets/

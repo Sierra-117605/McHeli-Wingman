@@ -9,9 +9,12 @@ import com.mcheliwingman.handler.AutonomousFlightHandler;
 import com.mcheliwingman.handler.ChunkLoadHandler;
 import com.mcheliwingman.handler.RangeOverrideHandler;
 import com.mcheliwingman.handler.UavChunkStreamer;
+import com.mcheliwingman.client.WingmanKeyHandler;
 import com.mcheliwingman.handler.WingmanTickHandler;
 import com.mcheliwingman.mission.MissionPlan;
 import com.mcheliwingman.network.WingmanNetwork;
+import net.minecraftforge.fml.relauncher.FMLLaunchHandler;
+import net.minecraftforge.fml.relauncher.Side;
 import net.minecraft.item.ItemBlock;
 import net.minecraftforge.common.ForgeChunkManager;
 import net.minecraftforge.common.MinecraftForge;
@@ -59,8 +62,13 @@ public class McHeliWingman {
         net.minecraftforge.fml.common.registry.GameRegistry.registerTileEntity(
             WingmanMarkerTileEntity.class, "mcheliwingman:wingman_marker_te");
 
-        // McHeli クリエイティブタブに追加（リフレクション）
-        tryAddToMcheliTab(MARKER_BLOCK);
+        // アイテムモデル登録（クライアントのみ）
+        if (FMLLaunchHandler.side() == Side.CLIENT) {
+            net.minecraftforge.client.model.ModelLoader.setCustomModelResourceLocation(
+                net.minecraft.item.Item.getItemFromBlock(MARKER_BLOCK), 0,
+                new net.minecraft.client.renderer.block.model.ModelResourceLocation(
+                    "mcheliwingman:wingman_marker", "inventory"));
+        }
     }
 
     @EventHandler
@@ -74,6 +82,14 @@ public class McHeliWingman {
         MinecraftForge.EVENT_BUS.register(new WingmanTickHandler());
         MinecraftForge.EVENT_BUS.register(new AutonomousFlightHandler());
         WingmanNetwork.register();
+        // McHeli クリエイティブタブに追加（init フェーズ: 全 Mod の preInit 完了後）
+        tryAddToMcheliTab(MARKER_BLOCK);
+        // クライアント専用: キーバインド登録 + HUD ヒント描画
+        if (FMLLaunchHandler.side() == Side.CLIENT) {
+            WingmanKeyHandler.registerClient();
+            MinecraftForge.EVENT_BUS.register(new WingmanKeyHandler());
+            MinecraftForge.EVENT_BUS.register(new com.mcheliwingman.handler.ClientAutopilotHandler());
+        }
         NetworkRegistry.INSTANCE.registerGuiHandler(instance, new WingmanGuiHandler());
         logger.info("{} initialized", NAME);
     }
@@ -85,24 +101,34 @@ public class McHeliWingman {
 
     /** McHeli のクリエイティブタブを取得してブロックを追加する。失敗しても起動は続行。 */
     private static void tryAddToMcheliTab(net.minecraft.block.Block block) {
-        try {
-            Class<?> cls = Class.forName("mcheli.MCH_CreativeTabs");
-            java.lang.reflect.Field tabField = null;
-            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
-                f.setAccessible(true);
-                Object val = f.get(null);
-                if (val instanceof net.minecraft.creativetab.CreativeTabs) { tabField = f; break; }
-            }
-            if (tabField != null) {
-                net.minecraft.creativetab.CreativeTabs tab =
-                    (net.minecraft.creativetab.CreativeTabs) tabField.get(null);
-                block.setCreativeTab(tab);
-                logger.info("[McHeliWingman] WingmanMarkerBlock added to McHeli creative tab.");
-            }
-        } catch (Exception e) {
-            // McHeliタブが見つからなくてもフォールバックとしてMISCタブに入れる
-            block.setCreativeTab(net.minecraft.creativetab.CreativeTabs.MISC);
-            logger.info("[McHeliWingman] McHeli tab not found, using MISC tab.");
+        // 1) 登録済み全タブからラベルに "mcheli" を含むものを探す（最も確実）
+        for (net.minecraft.creativetab.CreativeTabs tab : net.minecraft.creativetab.CreativeTabs.CREATIVE_TAB_ARRAY) {
+            if (tab == null) continue;
+            try {
+                String label = tab.getTabLabel();
+                if (label != null && label.toLowerCase().contains("mcheli")) {
+                    block.setCreativeTab(tab);
+                    logger.info("[McHeliWingman] Added to McHeli tab '{}'.", label);
+                    return;
+                }
+            } catch (Exception ignored) {}
         }
+        // 2) リフレクションで MCH_CreativeTabs クラスの static フィールドを探す
+        for (String cls : new String[]{"mcheli.MCH_CreativeTabs", "mcheli.MCH_CreativeTab", "mcheli.McHeli"}) {
+            try {
+                Class<?> c = Class.forName(cls);
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    f.setAccessible(true);
+                    Object val = f.get(null);
+                    if (val instanceof net.minecraft.creativetab.CreativeTabs) {
+                        block.setCreativeTab((net.minecraft.creativetab.CreativeTabs) val);
+                        logger.info("[McHeliWingman] Added to McHeli tab via {}.{}.", cls, f.getName());
+                        return;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        block.setCreativeTab(net.minecraft.creativetab.CreativeTabs.MISC);
+        logger.info("[McHeliWingman] McHeli tab not found, using MISC tab.");
     }
 }

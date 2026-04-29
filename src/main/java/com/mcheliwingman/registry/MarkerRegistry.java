@@ -38,13 +38,19 @@ public class MarkerRegistry extends WorldSavedData {
         public final BlockPos   pos;
         public final MarkerType type;
         public final String     id;
-        public final String     baseId;  // 所属ベースのID（BASE種別は空文字）
+        public final String     baseId;        // 所属ベースのID（BASE種別は空文字）
+        public final int        parkingHeading; // PARKING のみ: -1=任意, 0=N, 1=E, 2=S, 3=W
 
         public MarkerInfo(BlockPos pos, MarkerType type, String id, String baseId) {
-            this.pos    = pos;
-            this.type   = type;
-            this.id     = id;
-            this.baseId = baseId != null ? baseId : "";
+            this(pos, type, id, baseId, -1);
+        }
+
+        public MarkerInfo(BlockPos pos, MarkerType type, String id, String baseId, int parkingHeading) {
+            this.pos            = pos;
+            this.type           = type;
+            this.id             = id;
+            this.baseId         = baseId != null ? baseId : "";
+            this.parkingHeading = parkingHeading;
         }
     }
 
@@ -68,7 +74,7 @@ public class MarkerRegistry extends WorldSavedData {
     public static void register(World world, BlockPos pos, WingmanMarkerTileEntity te) {
         MarkerRegistry reg = get(world);
         reg.markers.removeIf(m -> m.pos.equals(pos));
-        reg.markers.add(new MarkerInfo(pos, te.getMarkerType(), te.getMarkerId(), te.getBaseId()));
+        reg.markers.add(new MarkerInfo(pos, te.getMarkerType(), te.getMarkerId(), te.getBaseId(), te.getParkingHeading()));
         reg.markDirty();
         McHeliWingman.logger.debug("[MarkerRegistry] registered {} {} id={} base={}",
             te.getMarkerType(), pos, te.getMarkerId(), te.getBaseId());
@@ -85,7 +91,7 @@ public class MarkerRegistry extends WorldSavedData {
         for (int i = 0; i < reg.markers.size(); i++) {
             MarkerInfo m = reg.markers.get(i);
             if (m.pos.equals(pos)) {
-                reg.markers.set(i, new MarkerInfo(pos, m.type, id, m.baseId));
+                reg.markers.set(i, new MarkerInfo(pos, m.type, id, m.baseId, m.parkingHeading));
                 reg.markDirty();
                 return;
             }
@@ -99,10 +105,22 @@ public class MarkerRegistry extends WorldSavedData {
 
     /** 直接 ID 検索（type も一致が必要）。 */
     public static MarkerInfo findById(World world, MarkerType type, String id) {
+        return findById(world, type, id, "");
+    }
+
+    /**
+     * 直接 ID 検索（type + id + baseId で検索）。
+     * baseId が空でない場合、まず baseId が一致するものを返す（完全一致優先）。
+     * 一致しなければ baseId を無視した最初のヒットを返す（後方互換フォールバック）。
+     */
+    public static MarkerInfo findById(World world, MarkerType type, String id, String baseId) {
+        MarkerInfo fallback = null;
         for (MarkerInfo m : get(world).markers) {
-            if (m.type == type && id.equals(m.id)) return m;
+            if (m.type != type || !id.equals(m.id)) continue;
+            if (!baseId.isEmpty() && baseId.equals(m.baseId)) return m; // 完全一致
+            if (fallback == null) fallback = m;                          // フォールバック候補
         }
-        return null;
+        return fallback;
     }
 
     /** 特定タイプのマーカーを全て返す。 */
@@ -167,6 +185,32 @@ public class MarkerRegistry extends WorldSavedData {
     }
 
     /**
+     * 指定基地の空き駐機スポットを返す（PARKING → HELIPAD の順で検索）。
+     * canUseHelipad = true のとき HELIPAD もフォールバック候補にする。
+     */
+    public static MarkerInfo findAvailableSpot(World world, String baseId,
+            java.util.List<net.minecraft.entity.Entity> loadedEntities, boolean canUseHelipad) {
+        // 1. 通常駐機スポット優先
+        MarkerInfo parking = findAvailableParking(world, baseId, loadedEntities);
+        if (parking != null) return parking;
+        // 2. ヘリパッドフォールバック
+        if (canUseHelipad) {
+            for (MarkerInfo m : get(world).markers) {
+                if (m.type != MarkerType.HELIPAD || !baseId.equals(m.baseId)) continue;
+                boolean occupied = false;
+                double px = m.pos.getX() + 0.5, pz = m.pos.getZ() + 0.5;
+                for (net.minecraft.entity.Entity e : loadedEntities) {
+                    if (!com.mcheliwingman.util.McheliReflect.isAircraft(e)) continue;
+                    double dx = e.posX - px, dz = e.posZ - pz;
+                    if (dx * dx + dz * dz < 8.0 * 8.0) { occupied = true; break; }
+                }
+                if (!occupied) return m;
+            }
+        }
+        return null;
+    }
+
+    /**
      * ルートノードの ID 解決。
      *
      * baseId="alpha" → BASE マーカー "alpha" を親として type の子を返す。
@@ -198,9 +242,10 @@ public class MarkerRegistry extends WorldSavedData {
             MarkerType type;
             try { type = MarkerType.valueOf(c.getString("type")); }
             catch (Exception e) { type = MarkerType.PARKING; }
-            String id     = c.getString("id");
-            String baseId = c.hasKey("baseId") ? c.getString("baseId") : "";
-            markers.add(new MarkerInfo(pos, type, id, baseId));
+            String id             = c.getString("id");
+            String baseId         = c.hasKey("baseId") ? c.getString("baseId") : "";
+            int    parkingHeading = c.hasKey("parkingHeading") ? c.getInteger("parkingHeading") : -1;
+            markers.add(new MarkerInfo(pos, type, id, baseId, parkingHeading));
         }
     }
 
@@ -215,6 +260,7 @@ public class MarkerRegistry extends WorldSavedData {
             c.setString("type",   m.type.name());
             c.setString("id",     m.id);
             c.setString("baseId", m.baseId);
+            if (m.parkingHeading >= 0) c.setInteger("parkingHeading", m.parkingHeading);
             list.appendTag(c);
         }
         tag.setTag("markers", list);

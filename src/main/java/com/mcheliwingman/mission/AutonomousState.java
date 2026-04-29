@@ -22,5 +22,9 @@ public enum AutonomousState {
     TRANSIT_TO,       // 任務エリアへ直行中
     ON_STATION,       // オンステーション（CAP/CAS 旋回・護衛・偵察）
     STRIKE_PASS,      // ストライクパス実行中
-    RTB               // 帰投中（任務エリア → 帰投基地）
+    RTB,              // 帰投中（任務エリア → 帰投基地）
+
+    // ─── VTOL 系 ────────────────────────────────────────────────────────────
+    VTOL_TAKEOFF,     // ヘリ・VTOL機のヘリパッドからの垂直離陸（cruiseAlt まで上昇）
+    VTOL_LAND         // ヘリ・VTOL機のヘリパッドへの垂直着陸（降下→接地）
 }

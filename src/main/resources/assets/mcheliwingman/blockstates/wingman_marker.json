@@ -1,5 +1,11 @@
 {
   "variants": {
-    "normal": { "model": "mcheliwingman:wingman_marker" }
+    "type=base":      { "model": "mcheliwingman:marker_base" },
+    "type=parking":   { "model": "mcheliwingman:marker_parking" },
+    "type=runway_a":  { "model": "mcheliwingman:marker_runway_a" },
+    "type=runway_b":  { "model": "mcheliwingman:marker_runway_b" },
+    "type=waypoint":  { "model": "mcheliwingman:marker_waypoint" },
+    "type=helipad":   { "model": "mcheliwingman:marker_helipad" },
+    "type=helipad_b": { "model": "mcheliwingman:marker_helipad_b" }
   }
 }

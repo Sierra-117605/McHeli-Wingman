@@ -5,6 +5,8 @@ import com.mcheliwingman.registry.TaxiRouteRegistry;
 import com.mcheliwingman.mission.TaxiRoute;
 import net.minecraft.block.Block;
 import net.minecraft.block.material.Material;
+import net.minecraft.block.properties.PropertyEnum;
+import net.minecraft.block.state.BlockStateContainer;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.tileentity.TileEntity;
@@ -12,9 +14,13 @@ import net.minecraft.util.EnumFacing;
 import net.minecraft.util.EnumHand;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.text.TextComponentString;
+import net.minecraft.world.IBlockAccess;
 import net.minecraft.world.World;
 
 public class WingmanMarkerBlock extends Block {
+
+    public static final PropertyEnum<MarkerType> TYPE =
+        PropertyEnum.create("type", MarkerType.class);
 
     public WingmanMarkerBlock() {
         super(Material.IRON);
@@ -22,6 +28,31 @@ public class WingmanMarkerBlock extends Block {
         setTranslationKey("wingman_marker");
         setHardness(2.0f);
         setResistance(10.0f);
+        setDefaultState(blockState.getBaseState().withProperty(TYPE, MarkerType.WAYPOINT));
+    }
+
+    @Override
+    protected BlockStateContainer createBlockState() {
+        return new BlockStateContainer(this, TYPE);
+    }
+
+    @Override
+    public IBlockState getStateFromMeta(int meta) {
+        return getDefaultState();
+    }
+
+    @Override
+    public int getMetaFromState(IBlockState state) {
+        return 0;
+    }
+
+    @Override
+    public IBlockState getActualState(IBlockState state, IBlockAccess world, BlockPos pos) {
+        TileEntity te = world.getTileEntity(pos);
+        if (te instanceof WingmanMarkerTileEntity) {
+            return state.withProperty(TYPE, ((WingmanMarkerTileEntity) te).getMarkerType());
+        }
+        return state;
     }
 
     @Override
@@ -48,7 +79,7 @@ public class WingmanMarkerBlock extends Block {
             // その他のマーカー: 通常のマーカー設定GUI
             com.mcheliwingman.network.WingmanNetwork.sendToPlayer(
                 new com.mcheliwingman.network.PacketOpenMarkerGui(
-                    pos, te.getMarkerType(), te.getMarkerId(), te.getBaseId()),
+                    pos, te.getMarkerType(), te.getMarkerId(), te.getBaseId(), te.getParkingHeading()),
                 mp);
         }
         return true;
@@ -69,11 +100,15 @@ public class WingmanMarkerBlock extends Block {
             dto.routeId     = r.routeId;
             dto.parkingId   = r.parkingId;
             dto.runwayId    = r.runwayId;
+            dto.runwayBId   = r.runwayBId;
             dto.waypointIds.addAll(r.waypointIds);
+            dto.arrivalWaypointIds.addAll(r.arrivalWaypointIds);
+            dto.arrivalRunwayId = r.arrivalRunwayId;
+            dto.parkingHeading = r.parkingHeading;
             pkt.routes.add(dto);
         }
 
-        // 子マーカーを収集（PARKING / WAYPOINT / RUNWAY_A / RUNWAY_B）
+        // 子マーカーを収集（baseId 一致）
         for (MarkerRegistry.MarkerInfo m : MarkerRegistry.findChildren(world, baseId)) {
             com.mcheliwingman.network.PacketOpenBaseGui.MarkerDto dto =
                 new com.mcheliwingman.network.PacketOpenBaseGui.MarkerDto();
@@ -81,12 +116,56 @@ public class WingmanMarkerBlock extends Block {
             dto.x  = m.pos.getX();
             dto.y  = m.pos.getY();
             dto.z  = m.pos.getZ();
-            if (m.type == MarkerType.PARKING)   pkt.parkingMarkers.add(dto);
-            else if (m.type == MarkerType.WAYPOINT) pkt.waypointMarkers.add(dto);
-            else if (m.type == MarkerType.RUNWAY_A) pkt.runwayAId = m.id;
-            else if (m.type == MarkerType.RUNWAY_B) pkt.runwayBId = m.id;
+            if (m.type == MarkerType.PARKING)         pkt.parkingMarkers.add(dto);
+            else if (m.type == MarkerType.WAYPOINT)  pkt.waypointMarkers.add(dto);
+            else if (m.type == MarkerType.RUNWAY_A)  { pkt.runwayAId = m.id; pkt.runwayAMarkers.add(dto); }
+            else if (m.type == MarkerType.RUNWAY_B)  { pkt.runwayBId = m.id; pkt.runwayBMarkers.add(dto); }
+            else if (m.type == MarkerType.HELIPAD)   pkt.helipads.add(dto);
+            else if (m.type == MarkerType.HELIPAD_B) pkt.helipadBMarkers.add(dto);
         }
 
+        // WAYPOINT 追加収集: baseId 未設定（新規設置直後など）でも 500 ブロック以内なら表示する。
+        // GUI の "Parent Base" 設定を忘れた場合でもルート策定画面に WP を出す。
+        java.util.Set<String> addedWpIds = new java.util.HashSet<>();
+        for (com.mcheliwingman.network.PacketOpenBaseGui.MarkerDto d : pkt.waypointMarkers) {
+            addedWpIds.add(d.id);
+        }
+        final double WP_RADIUS_SQ = 500.0 * 500.0;
+        for (MarkerRegistry.MarkerInfo m : MarkerRegistry.snapshot(world)) {
+            if (m.type != MarkerType.WAYPOINT) continue;
+            if (addedWpIds.contains(m.id)) continue; // baseId 一致で既に追加済み
+            double dx = m.pos.getX() - pos.getX();
+            double dz = m.pos.getZ() - pos.getZ();
+            if (dx * dx + dz * dz > WP_RADIUS_SQ) continue; // 500 ブロック超は除外
+            com.mcheliwingman.network.PacketOpenBaseGui.MarkerDto dto =
+                new com.mcheliwingman.network.PacketOpenBaseGui.MarkerDto();
+            dto.id = m.id;
+            dto.x  = m.pos.getX();
+            dto.y  = m.pos.getY();
+            dto.z  = m.pos.getZ();
+            pkt.waypointMarkers.add(dto);
+            com.mcheliwingman.McHeliWingman.logger.info(
+                "[OpenBaseGui] WP '{}' added via radius fallback (baseId='{}' unset)",
+                m.id, m.baseId);
+        }
+
+        // 近くの McHeli 機体を収集（512ブロック以内）
+        double bx = pos.getX(), bz = pos.getZ();
+        for (net.minecraft.entity.Entity e : world.loadedEntityList) {
+            if (!com.mcheliwingman.util.McheliReflect.isAircraft(e)) continue;
+            double dx = e.posX - bx, dz = e.posZ - bz;
+            if (dx * dx + dz * dz > 512.0 * 512.0) continue;
+            com.mcheliwingman.network.PacketOpenBaseGui.AircraftDto a =
+                new com.mcheliwingman.network.PacketOpenBaseGui.AircraftDto();
+            a.uuid = e.getUniqueID().toString();
+            a.name = e.getName();
+            pkt.nearbyAircraft.add(a);
+        }
+
+        com.mcheliwingman.McHeliWingman.logger.info(
+            "[OpenBaseGui] Sending to {}: baseId={} routes={} parkings={} runwayAs={} helipads={} aircraft={}",
+            player.getName(), baseId, pkt.routes.size(), pkt.parkingMarkers.size(),
+            pkt.runwayAMarkers.size(), pkt.helipads.size(), pkt.nearbyAircraft.size());
         com.mcheliwingman.network.WingmanNetwork.sendToPlayer(pkt, player);
     }
 
@@ -108,10 +187,12 @@ public class WingmanMarkerBlock extends Block {
     public static String autoId(World world, MarkerType type) {
         String prefix;
         switch (type) {
-            case PARKING:  prefix = "p";  break;
-            case RUNWAY_A: prefix = "ra"; break;
-            case RUNWAY_B: prefix = "rb"; break;
-            default:       prefix = "wp"; break;
+            case PARKING:   prefix = "p";   break;
+            case RUNWAY_A:  prefix = "ra";  break;
+            case RUNWAY_B:  prefix = "rb";  break;
+            case HELIPAD:   prefix = "hp";  break;
+            case HELIPAD_B: prefix = "hpb"; break;
+            default:        prefix = "wp";  break;
         }
         int n = MarkerRegistry.findByType(world, type).size() + 1;
         return prefix + "_" + n;
@@ -124,7 +205,7 @@ public class WingmanMarkerBlock extends Block {
                 p.sendMessage(new TextComponentString(
                     "§7Marker placed: " + te.getMarkerType().displayName()
                     + " §7id=§e" + te.getMarkerId()
-                    + " §7(Shift+click or §f/wingman marker type§7 to change type)"));
+                    + " §7(§f/wingman marker type§7 to change type)"));
                 break;
             }
         }
