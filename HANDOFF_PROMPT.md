@@ -1,157 +1,128 @@
-# McHeliWingman — Claude Code 引継ぎプロンプト
+# McHeli Wingman — Claude Code 引継ぎプロンプト
+> 更新: 2026-04-30
 
 ## あなたの役割
-あなたはこのプロジェクトの**プログラマー**です。
-ユーザーは要件とビルド・動作確認を担当します。
-コードの設計・実装・デバッグ指示はすべてあなたが行います。
+
+プログラマー。コードの設計・実装・デバッグ指示を担当する。  
+ユーザーはビルド・動作確認・要件判断を担当する。
 
 ---
 
 ## プロジェクト概要
 
-**MOD名**: McHeliWingman  
-**対象**: McHeli CE (Warfactory版) for Minecraft 1.12.2  
-**リポジトリ**: GitHub / McHeliWingman（新規作成予定）  
-**目的**: McHeli CEに対して機能を追加するサブMOD
+**MOD名**: McHeli Wingman  
+**対象**: McHeli 1.1.4 for Minecraft Forge 1.12.2  
+**リポジトリ**: https://github.com/Sierra-117605/McHeli-Wingman  
+**CurseForge**: https://www.curseforge.com/minecraft/mc-mods/mcheli-wingman  
+**状態**: v1.1.0 リリース済み・機能実装ほぼ完了
 
-McHeli CEはオープンソース（GPL-3）です。  
-ソース: https://github.com/Warfactory-Official/McHeliCE
-
----
-
-## 実装する機能（優先順）
-
-### P0: UAV飛行距離無制限（最優先）
-- デフォルト120ブロック制限を撤廃
-- `config/mcheli_wingman.cfg` の `uav.controllerRange` / `uav.maxDistance` で任意値に設定可能
-- MOD起動時にMcHeliCEの内部フィールドをリフレクションで上書き
-- McHeliCEがオープンソースなのでクラス名・フィールド名はソースから直接確認する
-
-### P1: 編隊飛行（フォーメーション追従）
-- `/wingman follow` でウイングマンUAVがリーダー機（プレイヤー搭乗機）の後方を追従
-- フォーメーションオフセットはリーダーのYawに合わせて回転
-- 毎tick `LivingUpdateEvent` で目標座標を更新
-
-### P2: ターゲット共有
-- リーダー機のロックオンターゲットをフォローモード中の僚機全機に伝達
-- `/wingman target share` / `clear`
-
-### P3: AI自律攻撃
-- ENGAGEモード時、射程・LOS確認後に自動発射
-- `/wingman engage` / `/wingman hold`
-
-### P4: コマンドシステム（P1と並行）
-```
-/wingman follow [UUID]
-/wingman stop
-/wingman engage
-/wingman hold
-/wingman target share|clear
-/wingman base set|show
-/wingman rtb [UUID]
-/wingman status
-```
-
-### P5: 自動帰還（RTB）
-- `/wingman base set` で登録座標へ自律飛行
-- 帰還完了後ホバリング停止
+McHeli 本体は非オープンソース（Murachiki 氏作）。内部アクセスはすべてリフレクション経由。
 
 ---
 
-## 技術スタック
+## ビルド手順
 
-| 項目 | 内容 |
-|---|---|
-| 言語 | Java 8 |
-| ビルド | Gradle + ForgeGradle 2.3 |
-| MCバージョン | 1.12.2 |
-| Forgeバージョン | 14.23.5.2860 |
-| 依存MOD | McHeli CE（libs/に配置） |
-| McHeliCEアクセス | ソース参照 + 必要に応じてリフレクション |
+```
+./gradlew.bat reobfJar
+```
+
+**`jar` タスクは絶対に使わない**。MCP フィールド名のまま出力され `NoSuchFieldError: IRON` でクラッシュする。  
+成果物: `build/libs/McHeliWingman-<version>.jar`
 
 ---
 
-## プロジェクト構造（目標）
+## ソース構造
 
 ```
-McHeliWingman/
-├── build.gradle
-├── gradle.properties
-├── settings.gradle
-├── gradle/wrapper/
-│   ├── gradle-wrapper.jar
-│   └── gradle-wrapper.properties
-├── libs/
-│   └── mcheli-ce-1.12.2.jar        ← ユーザーが配置
-├── src/main/java/com/mcheliwingman/
-│   ├── McHeliWingman.java           ← @Mod エントリポイント
-│   ├── config/
-│   │   └── WingmanConfig.java       ← Forge設定ファイル管理
-│   ├── command/
-│   │   └── WingmanCommand.java      ← /wingman コマンド
-│   ├── handler/
-│   │   ├── TickHandler.java         ← LivingUpdateEvent
-│   │   └── RangeOverrideHandler.java← P0: 飛行距離上書き
-│   ├── wingman/
-│   │   └── WingmanController.java   ← FSM本体（IDLE/FOLLOWING/ENGAGING/RETURNING）
-│   └── util/
-│       ├── FormationCalc.java       ← フォーメーション座標計算
-│       └── McheliReflect.java       ← McHeliCE内部へのリフレクションユーティリティ
-└── src/main/resources/
-    ├── mcmod.info
-    └── pack.mcmeta
+src/main/java/com/mcheliwingman/
+├── McHeliWingman.java              @Mod エントリポイント
+├── asm/
+│   ├── WingmanPlugin.java          FMLLoadingPlugin（ASMバイトコード変換）
+│   └── WingmanTransformer.java
+├── block/
+│   ├── MarkerType.java             enum (IStringSerializable実装)
+│   ├── WingmanMarkerBlock.java     PropertyEnum<MarkerType> + getActualState()
+│   └── WingmanMarkerTileEntity.java
+├── client/
+│   ├── GuiBaseConfig.java          BASEマーカーGUI（タキシールート・子マーカー）
+│   ├── GuiMarkerConfig.java        マーカー設定GUI
+│   ├── GuiNewRoute.java            タキシールート編集GUI
+│   ├── GuiWingmanPanel.java        僚機パネル（Numpad 0）
+│   ├── GuiWingmanPlanner.java      ミッションプランナーGUI（/wingman gui）
+│   ├── WingmanGuiHandler.java      NetworkRegistry.registerGuiHandler
+│   └── WingmanKeyHandler.java      キーバインド登録
+├── command/
+│   └── WingmanCommand.java         /wingman コマンド全種
+├── config/
+│   └── WingmanConfig.java          設定ファイル管理
+├── handler/
+│   ├── AutonomousFlightHandler.java 自律飛行ステート機械（毎tick）
+│   ├── ChunkLoadHandler.java        チャンク強制ロード管理
+│   ├── ClientAutopilotHandler.java  クライアント側ヨー・スロットル補正（Phase.END）
+│   ├── RangeOverrideHandler.java    UAV距離制限リフレクション上書き
+│   ├── UavChunkStreamer.java         UAV追尾チャンクロード
+│   └── WingmanTickHandler.java      僚機毎tick処理（フォーメーション・攻撃）
+├── mission/
+│   ├── AutonomousState.java         22ステートenum
+│   ├── MissionNode.java             FLY_TO / ATTACK / LOITER ノード
+│   ├── MissionOrder.java            発令情報（baseId・parkingId・タスクリスト等）
+│   ├── MissionPlan.java             JSON保存・読込
+│   ├── MissionType.java             CAP / CAS / STRIKE / ESCORT / RECON / FERRY
+│   └── TaxiRoute.java               タキシールートデータクラス
+├── network/
+│   ├── PacketAutopilotVisual.java   S→C ヨー・スロットル補正パケット
+│   ├── PacketBaseAction.java        BASE GUI → サーバー操作
+│   ├── PacketMarkerUpdate.java      マーカー設定保存
+│   ├── PacketMissionAction.java     ミッション操作
+│   ├── PacketOpenBaseGui.java       S→C BASEマーカーGUI開封データ
+│   ├── PacketOpenMarkerGui.java     S→C マーカーGUI開封データ
+│   ├── PacketPlannerData.java       ミッションプランナーデータ
+│   ├── PacketRouteAction.java       タキシールートCRUD
+│   ├── PacketWingmanPanelAction.java 僚機パネル操作
+│   ├── PacketWingmanPanelData.java  僚機パネルデータ
+│   ├── PacketWingmanPanelOpen.java  僚機パネル開封
+│   └── WingmanNetwork.java          SimpleNetworkWrapper 登録
+├── registry/
+│   ├── MarkerRegistry.java          world別マーカー管理
+│   └── TaxiRouteRegistry.java       world別タキシールート管理
+├── util/
+│   ├── McheliReflect.java           McHeli内部アクセス（メソッド/フィールドキャッシュ）
+│   └── WingmanUavRegistry.java      UAVエンティティ追跡
+└── wingman/
+    ├── WingmanEntry.java            僚機1機分の状態（autoState含む）
+    ├── WingmanRegistry.java         UUID → WingmanEntry マップ
+    └── WingmanState.java            IDLE / FOLLOWING
 ```
 
 ---
 
-## ウイングマンFSM状態遷移
+## 重要な実装パターン
 
-```
-IDLE
- └─ /wingman follow ──→ FOLLOWING
-                            └─ /wingman engage ──→ ENGAGING
-                            └─ /wingman rtb    ──→ RETURNING
-                                                      └─ 帰還完了 ──→ IDLE
- ←─ /wingman stop ─────────────────────────────────────────────────────┘
-```
+### ヨー・スロットル補正（搭乗中の自律飛行）
+McHeli の `onUpdateAircraft()` がクライアント側キー入力でヨーとスロットルを毎tick上書きする。  
+対策: `WingmanTickHandler`（サーバー）が `PacketAutopilotVisual` を S→C 送信。`ClientAutopilotHandler` が `TickEvent.ClientTickEvent` の **Phase.END** で再上書き。
 
----
+### マーカーブロックのタイプ別テクスチャ
+`PropertyEnum<MarkerType> TYPE` をブロックステートに持ち、`getActualState()` で TileEntity からタイプを読んで返す。メタデータは使わない（常に0）。
 
-## 作業の進め方
-
-1. **まずMcHeliCEのソースを読む**  
-   `https://github.com/Warfactory-Official/McHeliCE` のsrc以下を確認し、  
-   以下のクラス・フィールドを特定してから実装に入る：
-   - UAVエンティティのクラス名
-   - 飛行距離制限フィールド（`controllerRange` / `maxDistance` 相当）
-   - ロックオンターゲットのフィールド
-   - 武装発射メソッドのシグネチャ
-   - 機体速度・Yaw角の取得方法
-
-2. **M1: 空MODをビルドして動作確認**  
-   `@Mod` エントリポイントだけ持つ最小構成でForgeに読み込まれることを確認
-
-3. **M1.5: P0（飛行距離無制限）を実装**  
-   最も単独で価値があり、かつ実装が比較的シンプルなため最初に完成させる
-
-4. **M2以降: コマンド → 追従 → ターゲット共有 → 攻撃 → RTBの順で実装**
+### McHeli 内部アクセス
+`McheliReflect` でメソッド・フィールドを初回キャッシュし、以降は `invoke()` / `get()` で呼ぶ。  
+`setRotYaw()` `getCurrentThrottle()` `setCurrentThrottle()` `isHelicopter()` `isVtol()` など。
 
 ---
 
-## 制約・注意事項
+## 既知の未解決バグ（KNOWLEDGE.md・TODO.md 参照）
 
-- ビルド・環境構築・jarの配置・動作確認はユーザー側が行う
-- Claude Codeはコード生成・設計・デバッグ指示を担当
-- McHeliCEのライセンスはGPL-3なので本MODも同ライセンスで公開する想定
-- リフレクションを使う箇所はMcHeliCEのバージョンアップで壊れる可能性があることをコメントに明記
-- null安全を徹底する（McHeliCE側エンティティがnullの場合は必ずスキップ）
-- サーバーサイドで完結させる（クライアント専用処理は原則不要）
+- **TAKEOFF_ROLL yaw drift**: 離陸時に斜めに滑走。`setRotYaw()` 直接呼び出しで解決可能
+- **LANDING nose-up / 後輪めり込み**: 近距離（30〜50ブロック先）+ 大きな下方オフセットターゲットで改善可能
+- **着陸位置精度**: CIRCUIT サイズが広すぎるとチャンク外に逸脱
+- **VTOL_TAKEOFF / VTOL_LAND**: 修正済みだが動作確認未実施
 
 ---
 
-## 参考資料
+## 参考
 
-- McHeliCE ソース: https://github.com/Warfactory-Official/McHeliCE
-- McHeliCE Wiki: https://github.com/Warfactory-Offical/McHeliCE/wiki
-- Forge 1.12.2 MDK: https://files.minecraftforge.net/
-- 要件定義書: REQUIREMENTS.md（同リポジトリに同梱予定）
+- 詳細仕様: `REQUIREMENTS.md`
+- ハマりポイント集: `KNOWLEDGE.md`
+- 未解決タスク: `TODO.md`
+- README（ユーザー向け）: `README.md`

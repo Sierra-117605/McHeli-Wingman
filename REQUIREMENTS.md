@@ -1,350 +1,187 @@
-# MCHELI Wingman MOD — 要件定義書
-> Version 0.1 Draft  
-> 作成: 2026-03-31
+# McHeli Wingman — 機能仕様書
+> Version 1.1  
+> 更新: 2026-04-30（実装済みコードと照合）
 
 ---
 
 ## 1. プロジェクト概要
 
-### MOD名（仮）
-`mcheli-wingman` / 表示名: **MCHELI Wingman System**
+**MOD名**: McHeli Wingman  
+**対象**: McHeli 1.1.4 for Minecraft Forge 1.12.2  
+**リポジトリ**: https://github.com/Sierra-117605/McHeli-Wingman  
+**目的**: McHeli にAI僚機・自律飛行ミッション・マーカーブロック基地設定を追加するアドオン
 
-### 一行説明
-MCHELIの航空機エンティティに対して、編隊飛行・ターゲット共有・自律攻撃・RTBを提供するサブMOD。
+McHeli 本体の武器性能（射程・ダメージ等）は一切変更しない。
 
-### ターゲット環境
-| 項目 | 内容 |
+---
+
+## 2. 動作環境
+
+| 項目 | バージョン |
 |---|---|
-| メインバージョン | Minecraft Forge 1.12.2 |
-| サブバージョン | Minecraft Forge 1.7.10（余裕があれば） |
-| 依存MOD | MCHELI（必須） |
-| 利用環境 | 身内サーバー（数人規模） |
-| 配布 | 非公開（身内のみ） |
+| Minecraft | 1.12.2 |
+| Forge | 14.23.5.2847 以上 |
+| McHeli | 1.1.4 |
 
 ---
 
-## 2. 用語定義
+## 3. 実装済み機能
 
-| 用語 | 定義 |
+### F1: UAV 通信圏外制限の撤廃 ✅
+
+McHeli 標準の UAV 通信距離制限をリフレクションで上書きし、UAV ステーションから任意の距離でも UAV を操縦できるようにする。
+
+- `RangeOverrideHandler`: McHeli 内部フィールドをリフレクションで上書き
+- `UavChunkStreamer`: UAV 追尾チャンクロード（`ForgeChunkManager`）
+- `ChunkLoadHandler`: チャンク強制ロードチケット管理
+- `WingmanUavRegistry`: UAV エンティティ追跡レジストリ
+
+---
+
+### F2: AI 僚機（CCA）✅
+
+McHeli 機体をプレイヤー機に随伴させる編隊飛行システム。
+
+**状態機械**: `WingmanState` — `IDLE` / `FOLLOWING`  
+**データ**: `WingmanEntry`（状態・設定・自律ターゲット等を保持）  
+**レジストリ**: `WingmanRegistry`（UUID → WingmanEntry マップ）  
+**tick処理**: `WingmanTickHandler`（毎tick フォーメーション座標更新・ヨー制御・スロットル制御・ギア制御）
+
+**編隊**
+- 側方・高度・後退距離をリアルタイムで変更可能（`/wingman dist`）
+- 最大僚機数 1〜64（`/wingman maxwings`）
+
+**攻撃**
+- `FOLLOWING` → `ENGAGING`（指定ターゲット攻撃）
+- 自動攻撃モード（近くの敵 Mob を自律検知・攻撃）
+- 武器種指定・高度制限（min/max Y）
+
+**クライアント補正**: `ClientAutopilotHandler` + `PacketAutopilotVisual`  
+プレイヤーが搭乗中の僚機に対し、S→C パケットでヨーとスロットルを毎tick補正（McHeli クライアント側入力より Phase.END で後から上書き）
+
+---
+
+### F3: マーカーブロック ✅
+
+自律飛行に必要な地理情報をワールドに登録するブロック。
+
+**ブロック**: `WingmanMarkerBlock` + `WingmanMarkerTileEntity`  
+**タイプ**: `MarkerType` enum（`IStringSerializable` 実装）
+
+| タイプ | 用途 |
 |---|---|
-| **リーダー機** | プレイヤーが搭乗しているMCHELI航空機エンティティ |
-| **ウイングマン** | 本MODが制御するAI駆動のMCHELI UAVエンティティ |
-| **フォーメーション** | リーダー機に対する僚機の相対位置オフセット |
-| **ターゲット** | リーダー機またはウイングマンがロックオンしている敵エンティティ |
-| **FSM** | 有限状態機械（Finite State Machine）— ウイングマンの行動制御の核 |
-| **RTB** | Return to Base — 指定地点への自動帰還 |
+| `BASE` | 基地アンカー。子マーカーをまとめる親マーカー |
+| `PARKING` | 駐機場 |
+| `RUNWAY_A` | 滑走路端A（離陸起点・着陸終点） |
+| `RUNWAY_B` | 滑走路端B（タッチダウンゾーン） |
+| `WAYPOINT` | 空中巡航経由点 |
+| `HELIPAD` | ヘリ・VTOL機専用垂直離着陸スポット |
+| `HELIPAD_B` | ヘリパッド方向指示マーカー（機首向き基準） |
+
+**テクスチャ**: タイプ別 16×16 PNG（`blockstates` の `getActualState()` パターン）  
+**レジストリ**: `MarkerRegistry`（world → pos → MarkerInfo マップ）  
+**GUI**:
+- BASE マーカー右クリック → `PacketOpenBaseGui` → `GuiBaseConfig`（タキシールート・子マーカー・機体一覧）
+- その他マーカー右クリック → `PacketOpenMarkerGui` → `GuiMarkerConfig`（ID・タイプ・baseId・parkingHeading）
+- タイプ変更: `/wingman marker type <種別>`
 
 ---
 
-## 3. 機能要件
+### F4: タキシールート ✅
 
-### 優先順位マップ
-```
-P0 UAV飛行距離無制限 ←── 最優先・単独で価値あり
-P1 編隊飛行          ←── MVPコア
-P2 ターゲット共有     ←── MVPコア
-P3 自律攻撃           ←── Phase 2
-P4 コマンドシステム   ←── 全機能の入口（P1と同時開発）
-P5 自動帰還(RTB)      ←── Phase 2
-```
+駐機場 → 滑走路（またはヘリパッド）間の地上移動ルートを定義。
+
+**データ**: `TaxiRoute`（routeId・parkingId・runwayId・runwayBId・waypointIds・arrivalWaypointIds・arrivalRunwayId・parkingHeading）  
+**レジストリ**: `TaxiRouteRegistry`（world・baseId 別管理）  
+**GUI**: `GuiBaseConfig` の「Taxi Routes」タブ / `GuiNewRoute`（ルート編集）  
+**パケット**: `PacketRouteAction`（追加・削除・保存）
 
 ---
 
-### P0: UAV飛行距離無制限
+### F5: 自律飛行ミッションシステム ✅
 
-#### 概要
-MCHELIのUAVはデフォルトで操縦距離が120ブロックに制限されている。
-この制限をサーバー管理者が自由に変更・撤廃できるようにする。
+機体に対してミッションを発令すると、一連の行動を自動実行する。
 
-#### アプローチ（2段階）
-
-**Stage A: 設定ファイルによる上書き（即効性あり）**
-- MOD起動時にMCHELIの`controllerRange`・`maxDistance`をリフレクションで上書き
-- `config/mcheli_wingman.cfg`の`uav.range`値を適用
-- デフォルト値: `99999`（実質無制限）
-
-**Stage B: JSONアドオン雛形の提供（機体単位で設定）**
-- 新規機体JSON作成時に飛行距離無制限のテンプレートを同梱
-- 既存機体JSONへの追記ガイドをREADMEに記載
-
-#### 設定項目（`mcheli_wingman.cfg`）
-```
-uav {
-    # UAVのコントローラー有効距離（ブロック数）。-1で無制限
-    I:controllerRange=99999
-
-    # UAVの最大飛行距離（ブロック数）。-1で無制限
-    I:maxDistance=99999
-
-    # チャンク読み込みを強制するか（サーバー負荷注意）
-    B:forceChunkload=false
-}
-```
-
-#### MCHELIの内部確認が必要な箇所
-| # | 確認項目 | 用途 |
-|---|---|---|
-| 1 | 飛行距離制限を管理するクラス・フィールド名 | リフレクションで上書き対象 |
-| 2 | 距離チェックが走るタイミング（tick? パケット受信時?） | フックポイントの特定 |
-| 3 | `controllerRange`がJSONから読み込まれる箇所 | JSONパース後に介入できるか |
-
-#### 受け入れ条件
-- [ ] デフォルト状態で120ブロック制限が撤廃されている
-- [ ] cfgで任意の距離に変更できる
-- [ ] 設定変更後にサーバー再起動で反映される
-
----
-
-### P1 + P4: 編隊飛行 ＋ コマンドシステム（MVP）
-
-#### 概要
-プレイヤーがコマンドでウイングマンを「フォローモード」に設定すると、
-ウイングマンがリーダー機の後方・側方の指定オフセット座標を追尾し続ける。
-
-#### 機能詳細
-
-**コマンド**
-```
-/wingman follow        → 最寄りのウイングマンをフォローモードに
-/wingman follow <UUID> → 指定ウイングマンをフォローモードに
-/wingman status        → 全ウイングマンの状態表示
-/wingman stop          → 全ウイングマンをホールドモードに
-```
-
-**フォーメーション位置（デフォルト）**
-- ウイングマン1機目: リーダーの右後方 (+X, -Z 方向に30ブロック)
-- ウイングマン2機目: リーダーの左後方 (-X, -Z 方向に30ブロック)
-- 高度オフセット: ±0（同高度）
-- 最大追従距離: 設定ファイルで変更可能（デフォルト256ブロック）
-
-**フォーメーションオフセット計算**
-- リーダーのYaw（水平方向）に合わせてオフセットを回転させる
-- 毎tick更新（`LivingUpdateEvent`）
-
-**追従挙動**
-- 目標座標との距離が5ブロック以上 → 加速
-- 目標座標との距離が2ブロック以内 → 速度を落として維持
-- 目標座標に追いつけない（リーダーが高速）場合 → 最大速度でついていく
-
-#### 受け入れ条件
-- [ ] `/wingman follow`でウイングマンがリーダー機の後方を追う
-- [ ] リーダーが旋回すると僚機も旋回後の位置に追従する
-- [ ] リーダーが加速しても遅れながらもついてくる
-- [ ] `/wingman stop`でその場でホバリング（または直線飛行維持）
-
----
-
-### P2: ターゲット共有
-
-#### 概要
-リーダー機がロックオンしているターゲットを、フォローモード中のウイングマン全機に共有する。
-ウイングマンは受け取ったターゲットに対してロックオン状態を維持する。
-
-#### 機能詳細
-
-**共有トリガー**
-- リーダー機のロックオン情報をMCHELIのエンティティから毎tick取得
-- フォローモードのウイングマン全機に同一ターゲットを伝達
-
-**コマンド**
-```
-/wingman target share   → ターゲット共有を有効化
-/wingman target clear   → ウイングマン全機のターゲットをクリア
-```
-
-**MCHELIインターフェース要調査箇所**
-- `EntityPlane`（または相当クラス）のロックオンターゲットフィールド
-- ロックオン状態の取得メソッド名 → jarデコンパイル後に特定
-
-#### 受け入れ条件
-- [ ] リーダーがロックオンするとウイングマンも同ターゲットをロック
-- [ ] ターゲットが死亡/消滅したらウイングマンのロックも解除
-
----
-
-### P3: 自律攻撃判断
-
-#### 概要
-ウイングマンがターゲットを保持している場合、射程・LOS（視線）・クールダウンを
-自律的に判断して武装を発射する。
-
-#### 機能詳細
-
-**攻撃条件（ANDで全て満たす場合に発射）**
-1. ターゲットが設定されている
-2. ターゲットとの距離 ≤ 武装の射程（JSONから取得）
-3. ターゲットへの視線が遮られていない（raycast）
-4. 武装のクールダウンが0
-5. 攻撃モードが`ENGAGE`になっている
-
-**モード**
-- `HOLD` — 攻撃しない（デフォルト）
-- `ENGAGE` — 自律攻撃有効
-
-**コマンド**
-```
-/wingman engage  → 攻撃モードをENGAGEに
-/wingman hold    → 攻撃モードをHOLDに
-```
-
-#### 受け入れ条件
-- [ ] `engage`コマンド後、ターゲットが射程内に入ったら自動発射
-- [ ] `hold`コマンドで攻撃を停止
-- [ ] 壁越しには撃たない（raycast確認）
-
----
-
-### P5: 自動帰還（RTB）
-
-#### 概要
-コマンドで指定した座標（ベース）にウイングマンが自律飛行して帰還する。
-着陸は初期実装では対象外（指定高度でホバリング停止）。
-
-#### 機能詳細
-
-**ベース登録**
-```
-/wingman base set    → 現在地点をベースとして登録（プレイヤー位置）
-/wingman base show   → 登録ベースの座標表示
-```
-
-**RTBコマンド**
-```
-/wingman rtb         → 全ウイングマンをベースへ帰還
-/wingman rtb <UUID>  → 指定ウイングマンをベースへ帰還
-```
-
-**帰還挙動**
-1. 現在高度から帰還高度（Y+60）まで上昇
-2. ベース座標の真上まで直線飛行
-3. ベース真上でホバリング（フォローモード解除）
-
-#### 受け入れ条件
-- [ ] `base set`で登録した座標にウイングマンが自律移動する
-- [ ] 帰還中はフォローモード・攻撃モードが自動的にOFFになる
-
----
-
-## 4. 非機能要件
-
-| 項目 | 要件 |
-|---|---|
-| パフォーマンス | ウイングマン1機あたり毎tick処理を最小化（重い計算は10tick毎） |
-| 同時僚機数 | 最大4機まで動作保証（身内サーバー規模） |
-| 設定ファイル | `config/mcheli_wingman.cfg`でオフセット・距離・最大機数を変更可能 |
-| サーバー/クライアント | サーバーサイドで完結（クライアント不要） |
-| クラッシュ耐性 | MCHELI側エンティティがnullの場合は安全にスキップ |
-
----
-
-## 5. FSM 状態遷移図
+**状態機械**: `AutonomousState` enum（22ステート）
 
 ```
-              /wingman follow
-                    │
-              ┌─────▼──────┐
-        ┌────►│  FOLLOWING  │◄────────────────────────────┐
-        │     └─────┬───────┘                             │
-        │           │ /wingman engage                     │
-        │     ┌─────▼──────┐                             │
-        │     │  ENGAGING   │  ターゲット消滅 → FOLLOWING  │
-        │     └─────┬───────┘                             │
-        │           │ /wingman rtb                        │
-        │     ┌─────▼──────┐                             │
-        └─────│  RETURNING  │ 帰還完了 ──────────────────►│
-              └─────┬───────┘                             │
-                    │ /wingman stop                        │
-              ┌─────▼──────┐                             │
-              │    IDLE     │ /wingman follow ────────────┘
-              └─────────────┘
+NONE → TAXI_OUT → ALIGN → TAKEOFF_ROLL → CLIMB
+     → ENROUTE (FLY_TO ノード巡回)
+     → TRANSIT_TO → ON_STATION → STRIKE_PASS
+     → DESCEND → CIRCUIT_DOWNWIND → CIRCUIT_BASE → CIRCUIT_FINAL → LANDING
+     → TAXI_IN → PARKED
+
+VTOL系: VTOL_TAKEOFF / VTOL_LAND（HELIPAD マーカー使用時）
+```
+
+**ハンドラー**: `AutonomousFlightHandler`（毎tick 各ステートを `tickOrder*()` メソッドで処理）  
+**ミッションプラン**: `MissionPlan`（JSON保存・読込）+ `MissionNode`（FLY_TO / ATTACK / LOITER）  
+**ミッション種別**: `MissionType` — CAP / CAS / STRIKE / ESCORT / RECON / FERRY  
+**発令**: `MissionOrder`（baseId・parkingId・タスクリスト等を保持）  
+**GUI**: `GuiWingmanPlanner`（`/wingman gui`）+ `GuiNewRoute`
+
+**機体判定**: `McheliReflect.isHelicopter()` / `isVtol()` / `canUseHelipad()`  
+- VTOL 機が HELIPAD マーカー駐機時 → `VTOL_TAKEOFF` / `VTOL_LAND`  
+- VTOL 機が滑走路駐機時 → 通常 `TAKEOFF_ROLL` / `LANDING`
+
+**コマンド**:
+```
+/wingman order dispatch <uuid>   ミッション発令
+/wingman order abort [uuid]      中断（省略で全機）
+/wingman order status            実行状態表示
+/wingman order park <uuid>       駐機場へ帰還
+/wingman gui                     ミッションプランナーを開く
 ```
 
 ---
 
-## 6. 技術スタック
+### F6: 僚機パネル GUI ✅
 
-| 項目 | 内容 |
-|---|---|
-| 言語 | Java 8 |
-| ビルドツール | Gradle (ForgeGradle 2.3) |
-| MCバージョン | 1.12.2 (Forge 14.23.5.2860) |
-| MCHELIアクセス | jarをdeobf依存として追加 / Mixinまたはリフレクション |
-| MCHELI解析 | CFR Decompilerでクラス構造を特定 |
-| コード管理 | Claude Codeで実装 |
+Numpad 0 でゲーム内から開くリアルタイム制御パネル。
+
+**クラス**: `GuiWingmanPanel`  
+**キーバインド**: `WingmanKeyHandler`（`/wingman gui` 相当をキーで呼び出し）  
+**機能**: Auto / Hold / Stop ボタン、武器種選択（< >）、編隊パラメータ スピナー
 
 ---
 
-## 7. プロジェクト構造（予定）
+## 4. コマンド一覧
 
 ```
-mcheli-wingman/
-├── build.gradle
-├── gradle.properties
-├── src/main/java/
-│   └── com/yourname/mcheliwingman/
-│       ├── McheliWingman.java          ← @Modエントリポイント
-│       ├── config/
-│       │   └── WingmanConfig.java      ← 設定ファイル管理
-│       ├── command/
-│       │   └── WingmanCommand.java     ← /wingmanコマンド
-│       ├── entity/
-│       │   └── WingmanController.java  ← FSM本体・毎tick処理
-│       ├── handler/
-│       │   ├── TickHandler.java        ← LivingUpdateEventフック
-│       │   └── KeyHandler.java        ← キーバインド（将来）
-│       ├── network/
-│       │   └── WingmanPacket.java      ← S→C同期パケット
-│       └── util/
-│           ├── FormationCalc.java      ← フォーメーション座標計算
-│           └── McheliReflect.java      ← MCHELI内部へのリフレクション
-├── src/main/resources/
-│   ├── mcmod.info
-│   └── pack.mcmeta
-└── libs/
-    └── mcheli-1.12.2.jar               ← ローカル依存
+/wingman follow [uuid]          最寄りの機体（または指定UUID）を僚機に設定
+/wingman stop                   自機に随伴中の僚機を全解除
+/wingman status                 登録済み僚機の一覧と状態を表示
+/wingman dist <横> <高度> <後退> 編隊距離をリアルタイム変更
+/wingman maxwings <数>           最大僚機数 (1〜64)
+/wingman engage [uuid]          僚機に攻撃を命令
+/wingman auto                   自動攻撃モード
+/wingman hold                   攻撃中止・編隊復帰
+/wingman weapon [種別|clear]    武器種指定
+/wingman minalt [Y]             攻撃最低高度 (0=制限なし)
+/wingman maxalt [Y]             攻撃最高高度 (0=制限なし)
+/wingman alt clear              高度制限リセット
+/wingman spawnuav [種別]        UAVをプレイヤー正面にスポーン
+/wingman marker list            マーカー一覧表示
+/wingman marker type <種別>     見ているマーカーのタイプを設定
+/wingman marker id <ID>         見ているマーカーのIDを設定
+/wingman order dispatch <uuid>  ミッション発令
+/wingman order abort [uuid]     ミッション中断
+/wingman order status           ミッション状態表示
+/wingman order park <uuid>      駐機場へ帰還
+/wingman gui                    ミッションプランナーGUIを開く
 ```
 
 ---
 
-## 8. 未解決事項（実装前に要確認）
+## 5. ASM
 
-### MCHELI jarデコンパイルで特定が必要なもの
-
-| # | 確認項目 | 用途 |
-|---|---|---|
-| 1 | UAVエンティティのクラス名 | フック対象の特定 |
-| 2 | **飛行距離制限フィールド名・チェック箇所** | **P0: リフレクション上書き対象** |
-| 3 | ロックオンターゲットのフィールド名 | P2ターゲット共有 |
-| 4 | 武装発射メソッドのシグネチャ | P3自律攻撃 |
-| 5 | 機体速度・ヨー角の取得方法 | P1追従計算 |
-| 6 | UAVかどうかの判定方法 | ウイングマン対象の絞り込み |
-
-### 確認手順
-1. CFR Decompilerでmcheli jarをデコンパイル
-2. `Entity`を継承するクラスを全列挙
-3. `uav`・`lock`・`target`・`weapon`・`fire`などのキーワードで検索
-4. フィールド・メソッドシグネチャを`McheliReflect.java`にメモ
+`WingmanPlugin` / `WingmanTransformer`: McHeli クラスの動的バイトコード変換（`FMLLoadingPlugin`）。リフレクションで対応できない箇所への介入に使用。
 
 ---
 
-## 9. マイルストーン
+## 6. 未解決・改善余地
 
-| フェーズ | 内容 | 完了条件 |
-|---|---|---|
-| **M0** | 環境構築・MCHELI解析 | jarデコンパイル完了・クラス名特定 |
-| **M1** | 空MODビルド | Forgeに読み込まれログが出る |
-| **M1.5** | 飛行距離無制限 | cfg設定でUAV制限が撤廃される |
-| **M2** | コマンド実装 | `/wingman status`がゲーム内で動く |
-| **M3** | フォーメーション追従 | ウイングマンがリーダーの後方を追う |
-| **M4** | ターゲット共有 | リーダーのロックが僚機に伝わる |
-| **M5** | 自律攻撃 | ENGAGEモードで自動発射 |
-| **M6** | RTB | ベースに自律帰還してホバリング |
-
----
-
-## 10. 備考・制約
-
-- MCHELIはオープンソースではないため、リフレクションでの内部アクセスが主手段
-- MCHELI側のアップデートでリフレクション箇所が壊れる可能性がある（仕様）
-- 1.7.10対応は1.12.2が安定してから、同一設計で別ブランチとして対応
-- 武装発射の最終的な実装方法はデコンパイル結果次第で変わる可能性あり
+- TAKEOFF_ROLL yaw drift（斜め滑走）→ `setRotYaw()` 直接呼び出しで解決可能
+- LANDING 後 nose-up・後輪めり込み → 近距離 + 大きな下方オフセットターゲットで改善可能
+- 着陸位置精度（チャンク外逸脱時の CIRCUIT サイズ）
+- VTOL_TAKEOFF / VTOL_LAND の動作確認（修正後未テスト）
