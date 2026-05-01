@@ -918,25 +918,50 @@ public class WingmanTickHandler {
      * 注: unmanned（乗客なし）フォールバックは Phalanx 等の地上設置型兵器を誤検出するため不使用。
      *     isUAV() が BQM-74E で true を返すことを確認済み（MCP_EntityPlane）。
      */
-    private static boolean isEnemy(Entity e) {
+    /**
+     * 攻撃対象として有効な敵エンティティか判定する。
+     *
+     * 優先度:
+     * 1. プレイヤー本人・プレイヤーが乗っている機体 → 常に除外（フレンドリーファイア防止）
+     * 2. 自軍ウィングマン → 除外
+     * 3. McHeli の IFF チェック（MCH_Multiplay.canAttackEntity）→ チームシステムを尊重
+     * 4. IFF 取得失敗時フォールバック → IMob + UAV ドローン
+     */
+    private static boolean isEnemy(Entity wingman, Entity e) {
         // プレイヤー自身は絶対に攻撃しない
         if (e instanceof net.minecraft.entity.player.EntityPlayer) return false;
-        if (e instanceof IMob) return true;
-        // McHeli 航空機以外はスキップ
-        if (!com.mcheliwingman.util.McheliReflect.isAircraft(e)) return false;
         // 自軍ウィングマンは攻撃しない
         if (WingmanRegistry.snapshot().containsKey(e.getUniqueID())) return false;
         // プレイヤーが乗っている機体は攻撃しない（フレンドリーファイア防止）
         for (Entity passenger : e.getPassengers()) {
             if (passenger instanceof net.minecraft.entity.player.EntityPlayer) return false;
         }
-        // UAV（isUAV=true）のみ敵判定（BQM-74E 等のターゲットドローン）
+        // McHeli IFF チェック: MCH_Multiplay.canAttackEntity(attacker, target)
+        // チームシステムが有効な場合、味方チームのエンティティには false を返す
+        try {
+            Class<?> mp = Class.forName("mcheli.multiplay.MCH_Multiplay");
+            java.lang.reflect.Method canAttack = mp.getMethod("canAttackEntity",
+                    net.minecraft.entity.Entity.class, net.minecraft.entity.Entity.class);
+            Object result = canAttack.invoke(null, wingman, e);
+            if (result instanceof Boolean) {
+                boolean ok = (Boolean) result;
+                if (enemyLoggedSet.add(e.getUniqueID())) {
+                    McHeliWingman.logger.info(
+                        "[Wingman/IFF] {} → canAttackEntity={}", e.getName(), ok);
+                }
+                return ok;
+            }
+        } catch (Exception ex) {
+            // IFF 取得失敗: フォールバックへ
+        }
+        // フォールバック（IFF 未対応 or 取得失敗時）
+        if (e instanceof IMob) return true;
+        if (!com.mcheliwingman.util.McheliReflect.isAircraft(e)) return false;
         boolean uav = com.mcheliwingman.util.McheliReflect.isUAV(e);
-        // McHeli 機体の検出をエンティティごとに1回だけログ（spam 防止）
         if (enemyLoggedSet.add(e.getUniqueID())) {
             McHeliWingman.logger.info(
-                "[Wingman/CAP] McHeli aircraft found: name='{}' class={} isUAV={} → enemy={}",
-                e.getName(), e.getClass().getSimpleName(), uav, uav);
+                "[Wingman/CAP] McHeli aircraft found: name='{}' isUAV={} → enemy={}",
+                e.getName(), uav, uav);
         }
         return uav;
     }
@@ -950,7 +975,7 @@ public class WingmanTickHandler {
         Entity best   = null;
         outer:
         for (Entity e : wingman.world.loadedEntityList) {
-            if (e == wingman || !isEnemy(e) || e.isDead) continue;
+            if (e == wingman || !isEnemy(wingman, e) || e.isDead) continue;
             if (exclude != null && exclude.contains(e.getUniqueID())) continue;
             // 攻撃経路（wingman→ターゲット間の中点）が他の子機に近すぎる場合はスキップ
             if (minSep > 0 && siblings != null) {
