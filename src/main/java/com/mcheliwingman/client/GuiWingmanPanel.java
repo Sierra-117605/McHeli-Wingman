@@ -266,8 +266,8 @@ public class GuiWingmanPanel extends GuiScreen {
             int by = ry + i * 20;
             String header = "§f" + wm.name + " §7#" + wm.slot + " §8[" + wm.state + "]";
             drawString(fontRenderer, header, rx, by - 1, 0xFFFFFF);
-            // 武器ラベルを < > ボタンの中央に描画（< は bx+104 幅16, > は bx+156 幅16）
-            int wpnLabelX = bx + 104 + 16 + (156 - (104 + 16)) / 2; // gap 中央
+            // 武器ラベルを < > ボタンの中央に描画（< は rx+104 幅16, > は rx+156 幅16）
+            int wpnLabelX = rx + 104 + 16 + (156 - (104 + 16)) / 2; // gap 中央
             String wpnLabel = "§e" + weaponLabel(weaponIdx[i]);
             drawCenteredString(fontRenderer, wpnLabel, wpnLabelX, by + 3, 0xFFFFFF);
         }
