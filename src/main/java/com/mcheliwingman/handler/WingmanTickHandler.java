@@ -948,6 +948,18 @@ public class WingmanTickHandler {
         for (Entity passenger : e.getPassengers()) {
             if (passenger instanceof net.minecraft.entity.player.EntityPlayer) return false;
         }
+        // McHeli の非戦闘エンティティ（弾体・座席・ヒットボックス・フレア等）を除外する。
+        // これらは canAttackEntity=true を返す可能性があるが、攻撃対象として不正。
+        // 戦闘対象として有効な McHeli エンティティ: 機体・戦車・車両・ガンナーのみ。
+        String eClass = e.getClass().getName();
+        if (eClass.startsWith("mcheli.")) {
+            if (!com.mcheliwingman.util.McheliReflect.isAircraft(e)
+                    && !eClass.equals("mcheli.tank.MCH_EntityTank")
+                    && !eClass.equals("mcheli.vehicle.MCH_EntityVehicle")
+                    && !eClass.equals("mcheli.mob.MCH_EntityGunner")) {
+                return false; // 弾体・座席・ヒットボックス・フレア等は除外
+            }
+        }
         // McHeli IFF チェック: MCH_Multiplay.canAttackEntity(attacker, target)
         // チームシステムが有効な場合、味方チームのエンティティには false を返す
         try {

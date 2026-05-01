@@ -48,8 +48,12 @@ public class GuiWingmanPanel extends GuiScreen {
     private static final int MAX_NEARBY  = 8;
     private static final int MAX_WINGMEN = 8;
 
+    // 1機あたり: 名前行(9px) + 余白(4px) + ボタン行(14px) + 行間(5px) = 32px
+    private static final int WM_ROW_H          = 32;
+    // セクションタイトルから最初の行までのオフセット
+    private static final int WM_TOP            = 18;
     /** Wingmen タブのコンテンツ総高さ（最大機体数想定）。スクロール計算に使用。 */
-    private static final int WINGMEN_CONTENT_H = 172;
+    private static final int WINGMEN_CONTENT_H = WM_TOP + MAX_WINGMEN * WM_ROW_H + 8;
 
     // Formation タブ
     private static final int BTN_SIDE_DEC  = 100;
@@ -161,7 +165,8 @@ public class GuiWingmanPanel extends GuiScreen {
             PacketWingmanPanelData.WingmanDto wm = wingmen.get(i);
             int base = BTN_WINGMAN_BASE + i * WINGMAN_BTN_STRIDE;
             int bx   = rx;
-            int by   = sty + 8 + i * 20;
+            // 名前行(9px) + 余白(2px) = 11px下がったところにボタン行を置く
+            int by   = sty + WM_TOP + i * WM_ROW_H + 11;
 
             boolean isAuto = (wm.attackMode == WingmanEntry.ATK_AUTO);
             buttonList.add(new GuiButton(base + WM_AUTO, bx,      by, 34, 14, isAuto ? "§2Auto" : "Auto"));
@@ -263,13 +268,14 @@ public class GuiWingmanPanel extends GuiScreen {
         drawString(fontRenderer, "§7─ Your Wingmen ─", rx, sty + 2, 0x888888);
         for (int i = 0; i < Math.min(wingmen.size(), MAX_WINGMEN); i++) {
             PacketWingmanPanelData.WingmanDto wm = wingmen.get(i);
-            int by = ry + i * 20;
+            // 各行の先頭Y（WM_TOP + i * WM_ROW_H 分下がったところ）
+            int rowY = sty + WM_TOP + i * WM_ROW_H;
             String header = "§f" + wm.name + " §7#" + wm.slot + " §8[" + wm.state + "]";
-            drawString(fontRenderer, header, rx, by - 1, 0xFFFFFF);
-            // 武器ラベルを < > ボタンの中央に描画（< は rx+104 幅16, > は rx+156 幅16）
-            int wpnLabelX = rx + 104 + 16 + (156 - (104 + 16)) / 2; // gap 中央
+            drawString(fontRenderer, header, rx, rowY, 0xFFFFFF);
+            // 武器ラベル: ボタンY = rowY+11、ボタン高さ14 なので中央 = rowY+11+3
+            int wpnLabelX = rx + 104 + 16 + (156 - (104 + 16)) / 2; // < > の間の中央X
             String wpnLabel = "§e" + weaponLabel(weaponIdx[i]);
-            drawCenteredString(fontRenderer, wpnLabel, wpnLabelX, by + 3, 0xFFFFFF);
+            drawCenteredString(fontRenderer, wpnLabel, wpnLabelX, rowY + 14, 0xFFFFFF);
         }
         if (wingmen.isEmpty()) {
             drawString(fontRenderer, "§7(no wingmen assigned)", rx, ry + 3, 0x888888);
