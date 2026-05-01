@@ -167,8 +167,8 @@ public class GuiWingmanPanel extends GuiScreen {
             buttonList.add(new GuiButton(base + WM_AUTO, bx,      by, 34, 14, isAuto ? "§2Auto" : "Auto"));
             buttonList.add(new GuiButton(base + WM_HOLD, bx + 36, by, 32, 14, "Hold"));
             buttonList.add(new GuiButton(base + WM_STOP, bx + 70, by, 30, 14, "§cStop"));
-            buttonList.add(new GuiButton(base + WM_WPN_PREV, bx + 104, by, 14, 14, "<"));
-            buttonList.add(new GuiButton(base + WM_WPN_NEXT, bx + 154, by, 14, 14, ">"));
+            buttonList.add(new GuiButton(base + WM_WPN_PREV, bx + 104, by, 16, 14, "<"));
+            buttonList.add(new GuiButton(base + WM_WPN_NEXT, bx + 156, by, 16, 14, ">"));
         }
 
         // クリップ外のボタンを非表示
@@ -206,12 +206,13 @@ public class GuiWingmanPanel extends GuiScreen {
         addSpinner(BTN_MINAT_DEC, BTN_MINAT_INC, cx, ty + rowH*4 + 8, btnW);
         addSpinner(BTN_MAXAT_DEC, BTN_MAXAT_INC, cx, ty + rowH*5 + 8, btnW);
 
-        buttonList.add(new GuiButton(BTN_APPLY, cx - 30, ty + rowH*6 + 10, 60, 16, "Apply"));
+        buttonList.add(new GuiButton(BTN_APPLY, cx - 30, ty + rowH*7 + 10, 60, 16, "Apply"));
     }
 
     private void addSpinner(int decId, int incId, int cx, int y, int btnW) {
-        buttonList.add(new GuiButton(decId, cx - 50,         y, btnW, 14, "-"));
-        buttonList.add(new GuiButton(incId, cx - 50 + 70,    y, btnW, 14, "+"));
+        // - ボタン: cx-50, + ボタン: cx+32（gap 中央 = cx-1 に値テキストを描画するため）
+        buttonList.add(new GuiButton(decId, cx - 50, y, btnW, 14, "-"));
+        buttonList.add(new GuiButton(incId, cx + 32, y, btnW, 14, "+"));
     }
 
     // ─── Draw ────────────────────────────────────────────────────────────────
@@ -265,8 +266,10 @@ public class GuiWingmanPanel extends GuiScreen {
             int by = ry + i * 20;
             String header = "§f" + wm.name + " §7#" + wm.slot + " §8[" + wm.state + "]";
             drawString(fontRenderer, header, rx, by - 1, 0xFFFFFF);
-            int bx = rx + 104 + 14 + 2;
-            drawString(fontRenderer, "§e" + weaponLabel(weaponIdx[i]), bx, by + 3, 0xFFFFFF);
+            // 武器ラベルを < > ボタンの中央に描画（< は bx+104 幅16, > は bx+156 幅16）
+            int wpnLabelX = bx + 104 + 16 + (156 - (104 + 16)) / 2; // gap 中央
+            String wpnLabel = "§e" + weaponLabel(weaponIdx[i]);
+            drawCenteredString(fontRenderer, wpnLabel, wpnLabelX, by + 3, 0xFFFFFF);
         }
         if (wingmen.isEmpty()) {
             drawString(fontRenderer, "§7(no wingmen assigned)", rx, ry + 3, 0x888888);
@@ -278,7 +281,7 @@ public class GuiWingmanPanel extends GuiScreen {
 
     private void drawFormationTab(int cx, int ty) {
         int labelX = cx - 140;
-        int valueX = cx - 26;
+        int valueX = cx - 1; // gap 中央（- は cx-50 幅18 → 終点 cx-32、+ は cx+32 → gap cx-32〜cx+32 中央 = cx）
         int rowH   = 22;
         int baseY  = ty + 10;
 

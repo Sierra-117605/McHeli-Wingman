@@ -919,11 +919,17 @@ public class WingmanTickHandler {
      *     isUAV() が BQM-74E で true を返すことを確認済み（MCP_EntityPlane）。
      */
     private static boolean isEnemy(Entity e) {
+        // プレイヤー自身は絶対に攻撃しない
+        if (e instanceof net.minecraft.entity.player.EntityPlayer) return false;
         if (e instanceof IMob) return true;
         // McHeli 航空機以外はスキップ
         if (!com.mcheliwingman.util.McheliReflect.isAircraft(e)) return false;
         // 自軍ウィングマンは攻撃しない
         if (WingmanRegistry.snapshot().containsKey(e.getUniqueID())) return false;
+        // プレイヤーが乗っている機体は攻撃しない（フレンドリーファイア防止）
+        for (Entity passenger : e.getPassengers()) {
+            if (passenger instanceof net.minecraft.entity.player.EntityPlayer) return false;
+        }
         // UAV（isUAV=true）のみ敵判定（BQM-74E 等のターゲットドローン）
         boolean uav = com.mcheliwingman.util.McheliReflect.isUAV(e);
         // McHeli 機体の検出をエンティティごとに1回だけログ（spam 防止）
@@ -1361,10 +1367,24 @@ public class WingmanTickHandler {
         return spd < LEADER_STOP_SPEED;
     }
 
-    /** スロットルゼロで自然減速し、親機の向きに徐々に揃える（停止ホールド用）。 */
+    /**
+     * 停止ホールド。固定翼はスロットル0で減速、ヘリはホバー維持スロットルを使う。
+     * ヘリをスロットル0にすると重力で落下→過剰上昇を繰り返す無限上昇が起きるため、
+     * 少量スロットルで高度を保持する。
+     */
     private void holdStop(Entity aircraft, Entity leader) {
         resolveThrottle(aircraft);
-        applyThrottle(aircraft, 0.0);
+        boolean heli = isHelicopter(aircraft);
+        if (heli) {
+            // ヘリ: 高度誤差に応じてスロットルを微調整してホバリング維持
+            double targetY = leader.posY + WingmanConfig.formationAltOffset;
+            double dy = targetY - aircraft.posY;
+            // 誤差 ±3ブロック以内ならホバースロットル、それ以上は補正
+            double hover = 0.35 + Math.max(-0.15, Math.min(0.15, dy * 0.03));
+            applyThrottle(aircraft, hover);
+        } else {
+            applyThrottle(aircraft, 0.0);
+        }
         // 停止中は親機と同方向を向く（地上整列）
         resolveRotationMethods(aircraft);
         float leaderYaw = leader.rotationYaw;
