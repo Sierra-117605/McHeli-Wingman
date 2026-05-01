@@ -341,13 +341,6 @@ public class WingmanTickHandler {
 
                 if (isLeaderStopped(entry.leader) && distToSlot < HOLD_THRESHOLD) {
                     holdStop(wingman, entry.leader);
-                } else if (isHelicopter(wingman)) {
-                    // ヘリコプター: スロットル=揚力 なので距離ベースではなく常に高度補正ホバー制御
-                    // スロット距離に関わらず "leader.posY + altOffset" に向けてスロットル微調整
-                    // XZ 方向への移動は steerToTarget のピッチが担当する
-                    double hover = 0.35 + Math.max(-0.20, Math.min(0.20, dy * 0.04));
-                    applyThrottle(wingman, Math.max(0.05, Math.min(1.0, hover)));
-                    steerToTarget(ws, wingman, entry);
                 } else {
                     maintainEngineAdaptive(wingman, entry.leader, distToSlot);
                     steerToTarget(ws, wingman, entry);
@@ -629,13 +622,7 @@ public class WingmanTickHandler {
                     entry.leader.motionX * entry.leader.motionX +
                     entry.leader.motionY * entry.leader.motionY +
                     entry.leader.motionZ * entry.leader.motionZ);
-                if (isHelicopter(wingman)) {
-                    // ヘリコプター: Y方向はスロットルで制御するためブーストはXZ成分のみ
-                    double xzDist = Math.sqrt(fdx * fdx + fdz * fdz);
-                    applySlotBoost(wingman, fdx, 0.0, fdz, xzDist, leaderSpeed);
-                } else {
-                    applySlotBoost(wingman, fdx, fdy, fdz, distToSlot, leaderSpeed);
-                }
+                applySlotBoost(wingman, fdx, fdy, fdz, distToSlot, leaderSpeed);
             }
 
             if (entry.leader != null) {
