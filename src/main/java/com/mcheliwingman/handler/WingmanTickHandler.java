@@ -555,6 +555,18 @@ public class WingmanTickHandler {
                 continue;
             }
 
+            // プレイヤーがリーダー機から降りた場合、攻撃モードを自動的に HOLD にする。
+            // 降機後もオートモードのままだと標的を追って行方不明になるため。
+            if (!entry.isAutonomous() && entry.leader != null
+                    && entry.attackMode != WingmanEntry.ATK_NONE) {
+                Entity rider = getMcheliRider(entry.leader);
+                if (!(rider instanceof net.minecraft.entity.player.EntityPlayer)) {
+                    entry.attackMode = WingmanEntry.ATK_NONE;
+                    entry.manualTargetId = null;
+                    McHeliWingman.logger.info("[Wingman] {} auto-hold — leader has no rider", id);
+                }
+            }
+
             Entity wingman = ws.getEntityFromUuid(id);
             if (wingman == null || wingman.isDead) continue;
 
