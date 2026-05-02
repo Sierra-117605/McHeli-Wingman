@@ -611,18 +611,19 @@ public class WingmanTickHandler {
             }
 
             // スロット追従ブースト（編隊追従時のみ、McHeli物理更新後にpos加算）
+            // ※ Y成分は渡さない: setPosition()でposYを直接書き換えるとMcHeliが
+            //   「位置が変わった→上方補正」を繰り返す。高度はpitch/throttleに任せる。
             if (entry.attackMode == WingmanEntry.ATK_NONE && !entry.isAutonomous()
                     && entry.leader != null && !isLeaderStopped(entry.leader)) {
                 double[] fp = formationPos(entry.leader, entry.formationSlot);
                 double fdx = fp[0] - wingman.posX;
-                double fdy = fp[1] - wingman.posY;
                 double fdz = fp[2] - wingman.posZ;
-                double distToSlot = Math.sqrt(fdx * fdx + fdy * fdy + fdz * fdz);
+                double xzDist = Math.sqrt(fdx * fdx + fdz * fdz);
                 double leaderSpeed = Math.sqrt(
                     entry.leader.motionX * entry.leader.motionX +
                     entry.leader.motionY * entry.leader.motionY +
                     entry.leader.motionZ * entry.leader.motionZ);
-                applySlotBoost(wingman, fdx, fdy, fdz, distToSlot, leaderSpeed);
+                applySlotBoost(wingman, fdx, 0.0, fdz, xzDist, leaderSpeed);
             }
 
             if (entry.leader != null) {
